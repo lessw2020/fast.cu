@@ -1,22 +1,21 @@
-#include <cuda.h>
-#include <cudaTypedefs.h>
-#include <cuda/barrier>
+#include <cassert>
+#include <ctime>
 #include <cublas_v2.h>
+#include <cuda.h>
+#include <cuda/barrier>
+#include <cudaTypedefs.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <iostream>
+#include <random>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <ctime>
-#include <iostream>
 #include <vector>
-#include <random>
-#include <cuda_bf16.h>
-#include <cassert>
-#include <unistd.h>
 
 typedef __nv_bfloat16 bf16;
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
@@ -28,6 +27,8 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
 #include "examples/matmul/matmul_1.cuh"
+#include "examples/matmul/matmul_10.cuh"
+#include "examples/matmul/matmul_11.cuh"
 #include "examples/matmul/matmul_2.cuh"
 #include "examples/matmul/matmul_3.cuh"
 #include "examples/matmul/matmul_4.cuh"
@@ -36,16 +37,16 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 #include "examples/matmul/matmul_7.cuh"
 #include "examples/matmul/matmul_8.cuh"
 #include "examples/matmul/matmul_9.cuh"
-#include "examples/matmul/matmul_10.cuh"
-#include "examples/matmul/matmul_11.cuh"
 
 std::default_random_engine generator(69);
 cublasHandle_t cublas_handle;
 void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   float alpha = 1, beta = 0;
   // C(column major) = A(row major) * B(column major)
-  cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUDA_R_16BF,
-    N, B, CUDA_R_16BF, K, &beta, C, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  cublasStatus_t status =
+      cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A,
+                   CUDA_R_16BF, N, B, CUDA_R_16BF, K, &beta, C, CUDA_R_16BF, N,
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
   if (status != CUBLAS_STATUS_SUCCESS) {
     std::cout << "CUBLAS error: " << status << std::endl;
@@ -53,44 +54,45 @@ void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   }
 }
 
-void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB = nullptr) {
+void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C,
+                int *DB = nullptr) {
   switch (kernel_num) {
-    case 0:
-      runCublasGemmBF16(M, N, K, A, B, C);
-      break;
-    case 1:
-      runKernel1(M, N, K, A, B, C);
-      break;
-    case 2:
-      runKernel2(M, N, K, A, B, C);
-      break;
-    case 3:
-      runKernel3(M, N, K, A, B, C, DB);
-      break;
-    case 4:
-      runKernel4(M, N, K, A, B, C, DB);
-      break;
-    case 5:
-      runKernel5(M, N, K, A, B, C, DB);
-      break;
-    case 6:
-      runKernel6(M, N, K, A, B, C, DB);
-      break;
-    case 7:
-      runKernel7(M, N, K, A, B, C, DB);
-      break;
-    case 8:
-      runKernel8(M, N, K, A, B, C, DB);
-      break;
-    case 9:
-      runKernel9(M, N, K, A, B, C, DB);
-      break;
-    case 10:
-      runKernel10(M, N, K, A, B, C, DB);
-      break;
-    case 11:
-      runKernel11(M, N, K, A, B, C, DB);
-      break;
+  case 0:
+    runCublasGemmBF16(M, N, K, A, B, C);
+    break;
+  case 1:
+    runKernel1(M, N, K, A, B, C);
+    break;
+  case 2:
+    runKernel2(M, N, K, A, B, C);
+    break;
+  case 3:
+    runKernel3(M, N, K, A, B, C, DB);
+    break;
+  case 4:
+    runKernel4(M, N, K, A, B, C, DB);
+    break;
+  case 5:
+    runKernel5(M, N, K, A, B, C, DB);
+    break;
+  case 6:
+    runKernel6(M, N, K, A, B, C, DB);
+    break;
+  case 7:
+    runKernel7(M, N, K, A, B, C, DB);
+    break;
+  case 8:
+    runKernel8(M, N, K, A, B, C, DB);
+    break;
+  case 9:
+    runKernel9(M, N, K, A, B, C, DB);
+    break;
+  case 10:
+    runKernel10(M, N, K, A, B, C, DB);
+    break;
+  case 11:
+    runKernel11(M, N, K, A, B, C, DB);
+    break;
   }
 }
 int yo = 0;
@@ -107,11 +109,11 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
   int i;
   for (i = 0; i < N; i++) {
     int r = i / 8192, c = i % 8192;
-    int it = c*8192+r;
+    int it = c * 8192 + r;
     diff = std::fabs(__bfloat162float(matRef[i] - matOut[i]));
     if (diff > 0.1) {
       printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
-      __bfloat162float(matRef[i]), __bfloat162float(matOut[i]), diff, i);
+             __bfloat162float(matRef[i]), __bfloat162float(matOut[i]), diff, i);
       return false;
     }
   }
@@ -132,15 +134,16 @@ int main() {
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  long max_size = 8192;
+  long max_size = 4096;
   long m = max_size, n = max_size, k = max_size;
 
   bf16 *A = nullptr, *B = nullptr, *C = nullptr,
-        *C_ref = nullptr;  // host matrices
+       *C_ref = nullptr; // host matrices
   bf16 *dA = nullptr, *dB = nullptr, *dC = nullptr,
-        *dC_ref = nullptr; // device matrices
-  
-  int *DB = nullptr; int *dDB = nullptr;  
+       *dC_ref = nullptr; // device matrices
+
+  int *DB = nullptr;
+  int *dDB = nullptr;
 
   A = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
   B = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
@@ -152,16 +155,16 @@ int main() {
   randomize_matrix(A, max_size * max_size);
   randomize_matrix(B, max_size * max_size);
   randomize_matrix(C, max_size * max_size);
-  
+
   cudaCheck(cudaMalloc((void **)&dA, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dB, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(bf16) * max_size * max_size));
-  
+
   cudaCheck(cudaMemcpy(dA, A, sizeof(bf16) * max_size * max_size,
-  cudaMemcpyHostToDevice));
+                       cudaMemcpyHostToDevice));
   cudaCheck(cudaMemcpy(dB, B, sizeof(bf16) * max_size * max_size,
-      cudaMemcpyHostToDevice));
+                       cudaMemcpyHostToDevice));
 
   int repeat_times = 8;
   bool run_verif = true;
@@ -173,20 +176,27 @@ int main() {
     // Verify against cuBLAS. Also serves as a warmup step.
     if (run_verif) {
       memset(C, 0, sizeof(bf16) * max_size * max_size);
-      cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-      cudaCheck(cudaMemcpy(dC_ref, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
+      cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * max_size * max_size,
+                           cudaMemcpyHostToDevice));
+      cudaCheck(cudaMemcpy(dC_ref, C, sizeof(bf16) * max_size * max_size,
+                           cudaMemcpyHostToDevice));
       memset(DB, ~0, sizeof(int) * max_size * 128);
       cudaCheck(cudaMemcpy(dDB, DB, sizeof(int) * max_size * 128,
-        cudaMemcpyHostToDevice));
+                           cudaMemcpyHostToDevice));
       run_kernel(0, m, n, k, dA, dB, dC_ref); // cuBLAS
-      run_kernel(kernel_num, m, n, k, dA, dB, dC, dDB); // Executes the kernel, modifies the result matrix
+      run_kernel(kernel_num, m, n, k, dA, dB, dC,
+                 dDB); // Executes the kernel, modifies the result matrix
       cudaCheck(cudaDeviceSynchronize());
       cudaCheck(cudaGetLastError()); // Check for async errors during kernel run
-      cudaMemcpy(C, dC, sizeof(bf16) * max_size * max_size, cudaMemcpyDeviceToHost);
-      cudaMemcpy(C_ref, dC_ref, sizeof(bf16) * max_size * max_size, cudaMemcpyDeviceToHost);
+      cudaMemcpy(C, dC, sizeof(bf16) * max_size * max_size,
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(C_ref, dC_ref, sizeof(bf16) * max_size * max_size,
+                 cudaMemcpyDeviceToHost);
 
       if (kernel_num > 1 && !verify_matrix(C_ref, C, m * n)) {
-        std::cout << "~~~~~~~~~~~~~~~~ Failed to pass the correctness verification against cuBLAS. ~~~~~~~~~~~~~~~~" << std::endl;
+        std::cout << "~~~~~~~~~~~~~~~~ Failed to pass the correctness "
+                     "verification against cuBLAS. ~~~~~~~~~~~~~~~~"
+                  << std::endl;
         printf("%f\n", __bfloat162float(C_ref[m]));
       }
 
@@ -205,9 +215,10 @@ int main() {
         times++;
       }
       if (times > 0) {
-        printf("Load: %f, Compute: %f,  Store: %f, Datapoints: %d\n", (sumLoad + .0) / cntLoad, (sumCompute + .0) / cntCompute, (sumStore + .0) / cntStore, times);
+        printf("Load: %f, Compute: %f,  Store: %f, Datapoints: %d\n",
+               (sumLoad + .0) / cntLoad, (sumCompute + .0) / cntCompute,
+               (sumStore + .0) / cntStore, times);
       }
-
     }
 
     // Benchmark
@@ -221,10 +232,10 @@ int main() {
     cudaEventElapsedTime(&elapsed_time, start, stop);
 
     long flops = (2LL * m) * (n * k);
-    printf(
-        "Average elapsed time: (%7.6f) s, performance: (%7.1f) TFLOPS. size: (%ld).\n\n",
-        elapsed_time / 1000.0 / repeat_times,
-        (repeat_times * flops * 1e-9) / elapsed_time, m);
+    printf("Average elapsed time: (%7.6f) s, performance: (%7.1f) TFLOPS. "
+           "size: (%ld).\n\n",
+           elapsed_time / 1000.0 / repeat_times,
+           (repeat_times * flops * 1e-9) / elapsed_time, m);
   }
 
   // Free up CPU and GPU space
