@@ -6,7 +6,6 @@
 #include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-// #include <format>
 #include <iostream>
 #include <random>
 #include <stdio.h>
@@ -136,7 +135,8 @@ void print_usage() {
       << "               Default: 8192\n";
 }
 
-void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run) {
+void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run,
+                   bool append_results = false) {
   float elapsed_time;
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -177,6 +177,14 @@ void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run) {
   int repeat_times = 8;
   bool run_verif = true;
 
+  // Create/append to results file with header
+  if (!append_results) {
+    if (FILE *csv = fopen("benchmark_results.csv", "w")) {
+      fprintf(csv, "kernel,matrix_size,time,tflops,relative_perf\n");
+      fclose(csv);
+    }
+  }
+
   // Store cuBLAS performance for relative comparison
   float cublas_tflops = 0.0;
 
@@ -186,11 +194,19 @@ void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run) {
     std::cout << "\nKERNEL " << kernel_num << " (Matrix size: " << matrix_size
               << "x" << matrix_size << ")" << std::endl;
 
-    // Warmup phase - ensure all kernels including cuBLAS get a warmup run
+    // Warmup phase - run multiple warmup iterations
     memset(C, 0, sizeof(bf16) * matrix_size * matrix_size);
     cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * matrix_size * matrix_size,
                          cudaMemcpyHostToDevice));
-    run_kernel(kernel_num, m, n, k, dA, dB, dC);
+
+    // Run multiple warmup iterations to ensure steady state
+    const int warmup_iterations = 3;
+    for (int w = 0; w < warmup_iterations; w++) {
+      run_kernel(kernel_num, m, n, k, dA, dB, dC);
+      cudaCheck(cudaDeviceSynchronize());
+    }
+
+    // Additional sync to ensure warmup is complete
     cudaCheck(cudaDeviceSynchronize());
 
     // Verification phase
@@ -259,24 +275,28 @@ void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run) {
       cublas_tflops = current_tflops;
     }
 
-    // Calculate relative performance for non-cuBLAS kernels
-    std::string relative_perf = "";
+    // Calculate relative performance
+    char perf_str[64] = "";
     if (kernel_num != 0 && cublas_tflops > 0) {
       float perf_ratio = ((current_tflops / cublas_tflops) - 1.0) * 100;
-      relative_perf = perf_ratio; // >= 0
-      //                    ? std::format(" (+{:.1f}% vs cuBLAS)", perf_ratio)
-      //                    : std::format(" ({:.1f}% vs cuBLAS)", perf_ratio);
+      snprintf(perf_str, sizeof(perf_str), " (%+.1f%% vs cuBLAS)", perf_ratio);
     }
 
     // Print human-readable output
-    printf("Average elapsed time: (%7.6f) s, performance: (%7.1f) TFLOPS%s\n",
-           elapsed_time / 1000.0 / repeat_times, current_tflops,
-           relative_perf.c_str());
+    printf("Matrix Size: %ld x %ld, Average elapsed time: (%7.6f) s, "
+           "performance: (%7.1f) TFLOPS%s\n",
+           matrix_size, matrix_size, elapsed_time / 1000.0 / repeat_times,
+           current_tflops, perf_str);
 
     // Print CSV format for plotting
     if (FILE *csv = fopen("benchmark_results.csv", "a")) {
-      fprintf(csv, "%d,%ld,%f,%f\n", kernel_num, matrix_size,
-              elapsed_time / 1000.0 / repeat_times, current_tflops);
+      float relative_perf = 0.0;
+      if (kernel_num != 0 && cublas_tflops > 0) {
+        relative_perf = ((current_tflops / cublas_tflops) - 1.0) * 100;
+      }
+      fprintf(csv, "%d,%ld,%f,%f,%f\n", kernel_num, matrix_size,
+              elapsed_time / 1000.0 / repeat_times, current_tflops,
+              relative_perf);
       fclose(csv);
     }
   }
@@ -297,9 +317,9 @@ void run_benchmark(long matrix_size, const std::vector<int> &kernels_to_run) {
 int main(int argc, char *argv[]) {
   warmupKernel<<<1024, 1024>>>();
 
-  // Parse optional kernel number and matrix size
+  // Parse command line arguments
   int specific_kernel = -1;
-  long matrix_size = 8192; // Default size
+  long matrix_size = 8192;
 
   if (argc > 1) {
     specific_kernel = atoi(argv[1]);
@@ -325,15 +345,6 @@ int main(int argc, char *argv[]) {
 
   cublasCreate(&cublas_handle);
 
-  // Delete existing results file if it exists
-  remove("benchmark_results.csv");
-
-  // Create new results file with header
-  if (FILE *csv = fopen("benchmark_results.csv", "w")) {
-    fprintf(csv, "kernel,matrix_size,time,tflops\n");
-    fclose(csv);
-  }
-
   std::vector<int> kernels_to_run;
   if (specific_kernel >= 0) {
     kernels_to_run = {
@@ -345,12 +356,13 @@ int main(int argc, char *argv[]) {
   if (matrix_size == -1) {
     // Run the comparison set
     std::vector<long> sizes = {4096, 5120, 8192, 16384};
-    for (long size : sizes) {
+    for (size_t i = 0; i < sizes.size(); i++) {
       std::cout << "\n========================================" << std::endl;
-      std::cout << "Running benchmark with matrix size: " << size << "x" << size
-                << std::endl;
+      std::cout << "Running benchmark with matrix size: " << sizes[i] << "x"
+                << sizes[i] << std::endl;
       std::cout << "========================================" << std::endl;
-      run_benchmark(size, kernels_to_run);
+      run_benchmark(sizes[i], kernels_to_run,
+                    i > 0); // append results after first run
     }
   } else {
     // Run single size

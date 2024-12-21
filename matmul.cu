@@ -37,6 +37,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 #include "examples/matmul/matmul_7.cuh"
 #include "examples/matmul/matmul_8.cuh"
 #include "examples/matmul/matmul_9.cuh"
+#include "examples/matmul/matmul_utils.cuh"
 
 std::default_random_engine generator(69);
 cublasHandle_t cublas_handle;
