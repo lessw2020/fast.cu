@@ -56,6 +56,21 @@ __device__ static __forceinline__ void ptx_arrive(uint64_t *bar,
                : "r"(mbar_ptr), "r"(count)
                : "memory");
 }
+/*
+__device__ static __forceinline__ void wait_cluster(uint64_t *bar,
+                                                    int kPhaseBit) {
+  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile(
+      "{\n"
+      ".reg .pred                P1;\n"
+      "LAB_WAIT:\n"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
+      "@P1                       bra.uni DONE;\n"
+      "bra.uni                   LAB_WAIT;\n"
+      "DONE:\n"
+      "}\n" ::"r"(mbar_ptr),
+      "r"(kPhaseBit));
+}
 
 __device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
                                uint32_t count = 1) {
@@ -68,7 +83,7 @@ __device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
                :
                : "r"(smem_addr), "r"(cta_id), "r"(count));
 }
-
+*/
 // Common register allocation utilities
 template <uint32_t RegCount> __device__ void warpgroup_reg_alloc() {
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
@@ -414,7 +429,7 @@ __device__ static __forceinline__ void expect_bytes(uint64_t *bar,
       "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar_ptr),
       "r"(bytes));
 }
-
+/*
 __device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
   uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile("{\n"
@@ -436,7 +451,7 @@ __device__ static __forceinline__ void arrive(uint64_t *bar,
                : "r"(mbar_ptr), "r"(count)
                : "memory");
 }
-
+*/
 // Common async loading and storing utilities
 __device__ static inline void load_async(bf16 *dst, void const *src_tma_map,
                                          uint64_t *bar, int global_col_idx,

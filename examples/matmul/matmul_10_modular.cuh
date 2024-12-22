@@ -1,19 +1,85 @@
-#import "wgmma_utils.cuh"
-namespace M11 {
+#pragma once
+#include "matmul_utils.cuh";
 
-namespace wgm = wgmma_utils;
+namespace M10 {
+using namespace matmul_utils;
 
-__device__ void warpgroup_arrive() {
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-}
+class CUDABarrier {
+private:
+  uint64_t *barrier_ptr;
+  uint32_t smem_addr;
 
-__device__ void warpgroup_commit_batch() {
-  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-}
+  __device__ __forceinline__ static uint32_t get_smem_ptr(uint64_t *ptr) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+  }
 
-__device__ void warpgroup_wait() {
-  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-}
+public:
+  __device__ __forceinline__ CUDABarrier(uint64_t *ptr) : barrier_ptr(ptr) {
+    smem_addr = get_smem_ptr(ptr);
+  }
+
+  // Initialize barrier with thread count and transaction count
+  __device__ __forceinline__ void init(int thread_count,
+                                       int transaction_count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_addr),
+                 "r"(thread_count + transaction_count));
+  }
+
+  // Set expected bytes for transactions
+  __device__ __forceinline__ void expect_tx(uint32_t bytes) {
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            smem_addr),
+        "r"(bytes));
+  }
+
+  // Wait for barrier with phase bit
+  __device__ __forceinline__ void wait(int phase_bit) {
+    asm volatile("{\n"
+                 ".reg .pred                P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+                 "@P1                       bra.uni DONE;\n"
+                 "bra.uni                   LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(smem_addr),
+                 "r"(phase_bit));
+  }
+
+  // Wait for barrier with phase bit (cluster-wide)
+  __device__ __forceinline__ void wait_cluster(int phase_bit) {
+    asm volatile("{\n"
+                 ".reg .pred                P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, "
+                 "[%0], %1;\n"
+                 "@P1                       bra.uni DONE;\n"
+                 "bra.uni                   LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(smem_addr),
+                 "r"(phase_bit));
+  }
+
+  // Signal barrier arrival
+  __device__ __forceinline__ void arrive(uint32_t count = 1) {
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            smem_addr),
+        "r"(count)
+        : "memory");
+  }
+
+  // Signal barrier arrival (cluster-wide)
+  __device__ __forceinline__ void arrive_cluster(uint32_t cta_id,
+                                                 uint32_t count = 1) {
+    asm volatile("{\n\t"
+                 ".reg .b32 remAddr32;\n\t"
+                 "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+                 "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+                 "}" ::"r"(smem_addr),
+                 "r"(cta_id), "r"(count));
+  }
+};
 
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle = true>
 __host__ static inline CUtensorMap
@@ -50,13 +116,19 @@ template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
           int TransB>
 __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
                                       bf16 *sB) {
-  static_assert(WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
+  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
+                WGMMA_N == 192 || WGMMA_N == 208 || WGMMA_N == 256);
+
   if constexpr (WGMMA_N == 256)
-    wgm::wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
   if constexpr (WGMMA_N == 192)
-    wgm::wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
   if constexpr (WGMMA_N == 128)
-    wgm::wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 64)
+    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 32)
+    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
 template <uint32_t RegCount> __device__ void warpgroup_reg_alloc() {
@@ -89,10 +161,6 @@ __device__ static inline void load_async(bf16 *dst, void const *src_tma_map,
   uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
-  // We use 3d tiling to load from GMEM to SMEM. 2d tiling only works for tiles
-  // <= 64 columns. For larger tiles, we need 3d tiling: First dimension: 64
-  // (columns) Second dimension: Row Third dimension: Column / 64 I spent a lot
-  // of time figuring this out. Hope this gets documented at some point.
   asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
                "complete_tx::bytes"
                " [%0], [%1, {%3, %4, %5}], [%2];"
@@ -116,42 +184,6 @@ __device__ static inline void store_async(void const *dst_tma_map, bf16 *src,
                : "memory");
 }
 
-__device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  // Call mbarrier.try_wait in a while loop till it returns true.
-  asm volatile("{\n"
-               ".reg .pred                P1;\n"
-               "LAB_WAIT:\n"
-               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-               "@P1                       bra.uni DONE;\n"
-               "bra.uni                   LAB_WAIT;\n"
-               "DONE:\n"
-               "}\n" ::"r"(mbar_ptr),
-               "r"(kPhaseBit));
-}
-
-__device__ static __forceinline__ void arrive(uint64_t *bar,
-                                              uint32_t count = 1) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
-               :
-               : "r"(mbar_ptr), "r"(count)
-               : "memory");
-}
-
-__device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
-                               uint32_t count = 1) {
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  // Call arrive on barrier stored in SM number `cta_id`
-  // Use mapa.shared instruction to access other SM's barrier.
-  asm volatile("{\n"
-               ".reg .b32 remAddr32;\n"
-               "mapa.shared::cluster.u32  remAddr32, %0, %1;\n"
-               "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n"
-               "}" ::"r"(smem_addr),
-               "r"(cta_id), "r"(count));
-}
-
 __device__ static inline void
 load_async_multicast(bf16 *dst, void const *src_tma_map, uint64_t *bar,
                      int global_col_idx, int global_row_idx,
@@ -173,29 +205,32 @@ load_async_multicast(bf16 *dst, void const *src_tma_map, uint64_t *bar,
 template <int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
-constexpr int SPACE_LEN = 128;
-int *_dspace;
-
 template <int NUM_SM, int BM, int BN, int TM, int TN>
-struct Schedule<2, NUM_SM, BM, BN, TM, TN> {
+struct Schedule<1, NUM_SM, BM, BN, TM, TN> {
+  int block;
   int it;
-  int *space;
+  int total_blocks_m, total_blocks_n;
 
-  __device__ __forceinline__ Schedule(int M, int N, int block, int *_space) {
+  __device__ __forceinline__ Schedule(int M, int N, int _block) {
+    block = _block;
     it = 0;
-    space = _space;
+    total_blocks_m = CEIL_DIV(M, BM);
+    total_blocks_n = CEIL_DIV(N, BN);
+    assert(CEIL_DIV(M, BM) % TM == 0 && total_blocks_n % TN == 0);
   }
 
   __device__ __forceinline__ bool next(int &block_m, int &block_n) {
-    if (it >= SPACE_LEN) {
+    int num = it * NUM_SM + block;
+    if (num >= total_blocks_m * total_blocks_n) {
       return false;
     }
-    int now = space[it];
-    if (now == -1) {
-      return false;
-    }
-    block_m = now >> 16;
-    block_n = (now & ((1 << 16) - 1));
+
+    int cur_tile = num / (TM * TN);
+    int cur_tile_pos = num % (TM * TN);
+    block_m = TM * (cur_tile / (total_blocks_n / TN));
+    block_n = TN * (cur_tile % (total_blocks_n / TN));
+    block_m += cur_tile_pos / TN;
+    block_n += cur_tile_pos % TN;
     ++it;
     return true;
   }
@@ -206,18 +241,16 @@ template <int BM, int BN, int BK, int QSIZE> struct SMem {
   alignas(128) bf16 B[BK * BN * QSIZE];
   alignas(128) bf16 C[BN * BM];
   alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-  int space[SPACE_LEN];
 };
 
 template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
           int CLUSTER_M, int CLUSTER_N>
 __global__
 __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
-    matmulKernel11(int M, int N, int K,
+    matmulKernel10(int M, int N, int K,
                    const __grid_constant__ CUtensorMap tensorMapC,
                    const __grid_constant__ CUtensorMap tensorMapA,
-                   const __grid_constant__ CUtensorMap tensorMapB,
-                   int *dspace) {
+                   const __grid_constant__ CUtensorMap tensorMapB) {
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
@@ -230,13 +263,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       *reinterpret_cast<SMem<BM, BN, BK, QSIZE> *>(smem);
   bf16 *sA = s.A, *sB = s.B, *sC = s.C;
   uint64_t *full = s.full, *empty = s.empty;
-  int *space = s.space;
 
   uint32_t rank;
   asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
-  // Load schedule for this SM
-  if (threadIdx.x < SPACE_LEN)
-    space[threadIdx.x] = dspace[rank * SPACE_LEN + threadIdx.x];
 
   const int num_blocks_k = K / BK;
   int wg_idx = threadIdx.x / 128;
@@ -251,9 +280,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   asm volatile("barrier.cluster.arrive;\n" : :);
   asm volatile("barrier.cluster.wait;\n" : :);
 
-  Schedule<2, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
+  Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
-      schedule(M, N, rank, &space[0]);
+      schedule(M, N, rank);
 
   asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
   uint32_t rank_m = rank / CLUSTER_N;
@@ -281,7 +310,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             qidx = 0;
             p ^= 1;
           }
-          wait(&empty[qidx], p);
+          ptx_wait(&empty[qidx], p);
 
           expect_bytes(&full[qidx], (BK * BN + BK * BM) * sizeof(bf16));
           if constexpr (CLUSTER_N > 1) {
@@ -330,7 +359,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           qidx = 0;
           p ^= 1;
         };
-        wait(&full[qidx], p);
+        ptx_wait(&full[qidx], p);
         warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
@@ -359,7 +388,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           }
         }
         warpgroup_commit_batch();
-        warpgroup_wait();
+        warpgroup_wait<0>();
         if (tid < CLUSTERS)
           arrive_cluster(&empty[qidx], tid);
         ++qidx;
@@ -389,7 +418,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           }
         }
         warpgroup_commit_batch();
-        warpgroup_wait();
+        warpgroup_wait<0>();
         if (tid < CLUSTERS)
           arrive_cluster(&empty[qidx], tid);
       }
@@ -420,12 +449,11 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           ST(row, col + 9, d[m_it][w / 16][5]);
           ST(row + 8, col + 9, d[m_it][w / 16][7]);
 
+// #undef IDX
 #undef ST
         }
       }
-      // Wait for all 256 consumer threads to reach here
-      asm volatile("bar.sync 1, 256;\n");
-
+      asm volatile("bar.sync 10, 256;\n");
       if (threadIdx.x == 128) {
         store_async(&tensorMapC, (bf16 *)&sC[0], num_block_m * BM,
                     num_block_n * BN);
@@ -435,77 +463,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   }
 }
 
-// Rotate/flip quadrant appropriately
-void rot(int n, int &x, int &y, int rx, int ry) {
-  if (ry == 0) {
-    if (rx == 1) {
-      x = n - 1 - x;
-      y = n - 1 - y;
-    }
-    // Swap x and y
-    int t = x;
-    x = y;
-    y = t;
-  }
-}
-
-// Convert distance along curve to (x,y) point
-void d2xy(int n, int d, int &x, int &y) {
-  int rx, ry, s, t = d;
-  x = y = 0;
-  for (s = 1; s < n; s *= 2) {
-    rx = 1 & (t / 2);
-    ry = 1 & (t ^ rx);
-    rot(s, x, y, rx, ry);
-    x += s * rx;
-    y += s * ry;
-    t /= 4;
-  }
-}
-
-void createHilbert(int M, int N, int CORES, int *space) {
-  int dim = (1 << (32 - __builtin_clz(max(M, N) - 1)));
-  int core = 0;
-  std::vector<std::string> v(dim, std::string(dim, '.'));
-  memset(space, -1, sizeof(int) * CORES * SPACE_LEN);
-  int FCORES = 64;
-  int total = 0;
-  std::vector<std::vector<int>> pos(CORES, std::vector<int>());
-  for (int i = 0; i < dim * dim; ++i) {
-    int x, y;
-    d2xy(dim, i, x, y);
-    if (x < M && y < N) {
-      assert(loc < SPACE_LEN);
-      assert(v[x][y] == '.');
-      v[x][y] = '*';
-      ++total;
-      pos[core].push_back((x << 16) | y);
-      ++core;
-      if (core == FCORES) {
-        core = 0;
-      }
-    }
-  }
-  core = FCORES;
-  for (int i = 0; i < FCORES; ++i) {
-    if (pos.back().size() >= pos[0].size() - 1)
-      break;
-    pos[core].push_back(pos[i].back());
-    pos[i].pop_back();
-    ++core;
-    if (core == CORES) {
-      core = FCORES;
-    }
-  }
-  for (int i = 0; i < CORES; ++i) {
-    for (int j = 0; j < pos[i].size(); ++j) {
-      space[i * SPACE_LEN + j] = pos[i][j];
-    }
-  }
-  assert(total == M * N);
-}
-
-void runKernel11(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
+void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   constexpr int BM = 128;
   constexpr int BN = 256;
   constexpr int BK = 64;
@@ -523,17 +481,10 @@ void runKernel11(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     _prev_m = M;
     _prev_n = N;
     _prev_k = K;
-    int *space;
-    space = (int *)malloc(sizeof(int) * NUM_SM * SPACE_LEN);
-    createHilbert(CEIL_DIV(M, BM * CLUSTER_M), CEIL_DIV(N, BN * CLUSTER_N),
-                  NUM_SM / CLUSTER_M / CLUSTER_N, space);
-    cudaCheck(cudaMalloc((void **)&_dspace, sizeof(int) * NUM_SM * SPACE_LEN));
-    cudaCheck(cudaMemcpy(_dspace, space, sizeof(int) * NUM_SM * SPACE_LEN,
-                         cudaMemcpyHostToDevice));
   }
   // Assert cached values are of same size
   assert(M == _prev_m && N == _prev_n && K == _prev_k);
-  auto *kernel = matmulKernel11<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM,
+  auto *kernel = matmulKernel10<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM,
                                 CLUSTER_M, CLUSTER_N>;
   constexpr size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
   static_assert(sMemSize < 256 * 1024);
@@ -541,9 +492,9 @@ void runKernel11(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
   kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, d_tma_map_C, d_tma_map_A,
-                                            d_tma_map_B, _dspace);
+                                            d_tma_map_B);
 }
 
-} // namespace M11
+} // namespace M10
 
-using M11::runKernel11;
+using M10::runKernel10;
