@@ -3,95 +3,6 @@ namespace M11 {
 
 namespace wgm = wgmma_utils;
 
-class CUDABarrier {
-private:
-  uint64_t *barrier_ptr;
-  uint32_t smem_addr;
-
-  __device__ __forceinline__ uint32_t get_smem_ptr() const {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(barrier_ptr));
-  }
-
-public:
-  __device__ CUDABarrier(uint64_t *ptr) : barrier_ptr(ptr) {
-    smem_addr = get_smem_ptr();
-  }
-  __device__ CUDABarrier() { smem_addr = get_smem_ptr(); }
-
-  __device__ void init(int thread_count, int transaction_count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_addr),
-                 "r"(thread_count + transaction_count));
-  }
-
-  __device__ void expect_bytes(uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-            smem_addr),
-        "r"(bytes));
-  }
-
-  __device__ void wait(int kPhaseBit) {
-    asm volatile("{\n"
-                 ".reg .pred                P1;\n"
-                 "LAB_WAIT:\n"
-                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-                 "@P1                       bra.uni DONE;\n"
-                 "bra.uni                   LAB_WAIT;\n"
-                 "DONE:\n"
-                 "}\n" ::"r"(smem_addr),
-                 "r"(kPhaseBit));
-  }
-
-  __device__ void arrive(uint32_t count = 1) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-            smem_addr),
-        "r"(count)
-        : "memory");
-  }
-
-  __device__ void arrive_cluster(uint32_t cta_id, uint32_t count = 1) {
-    // Call arrive on barrier stored in SM number `cta_id`
-    // Use mapa.shared instruction to access other SM's barrier
-    asm volatile("{\n"
-                 ".reg .b32 remAddr32;\n"
-                 "mapa.shared::cluster.u32  remAddr32, %0, %1;\n"
-                 "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n"
-                 "}" ::"r"(smem_addr),
-                 "r"(cta_id), "r"(count));
-  }
-
-  // Warpgroup synchronization methods
-  __device__ static void warpgroup_arrive() {
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-  }
-
-  __device__ static void warpgroup_commit_batch() {
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-  }
-
-  __device__ static void warpgroup_wait() {
-    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-  }
-
-  template <uint32_t RegCount> __device__ static void warpgroup_reg_alloc() {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-  }
-
-  template <uint32_t RegCount> __device__ static void warpgroup_reg_dealloc() {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-  }
-
-  // Cluster barrier methods
-  __device__ static void cluster_arrive() {
-    asm volatile("barrier.cluster.arrive;\n" : :);
-  }
-
-  __device__ static void cluster_wait() {
-    asm volatile("barrier.cluster.wait;\n" : :);
-  }
-};
-
 __device__ void warpgroup_arrive() {
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
@@ -295,7 +206,6 @@ template <int BM, int BN, int BK, int QSIZE> struct SMem {
   alignas(128) bf16 B[BK * BN * QSIZE];
   alignas(128) bf16 C[BN * BM];
   alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-
   int space[SPACE_LEN];
 };
 
@@ -332,30 +242,14 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   int wg_idx = threadIdx.x / 128;
   int tid = threadIdx.x % 128;
 
-  // if (threadIdx.x == 0) {
-  //   for (int i = 0; i < QSIZE; ++i) {
-  //     init_barrier(&full[i], 0, 1);
-  //     init_barrier(&empty[i], 0, num_consumers * CLUSTERS);
-  //   }
-  // }
-  //  Initialize barriers using the new class
-  CUDABarrier barriers_full[QSIZE], barriers_empty[QSIZE];
-  for (int i = 0; i < QSIZE; i++) {
-    barriers_full[i] = CUDABarrier(&full[i]);
-    barriers_empty[i] = CUDABarrier(&empty[i]);
-  }
-
   if (threadIdx.x == 0) {
     for (int i = 0; i < QSIZE; ++i) {
-      barriers_full[i].init(0, 1);
-      barriers_empty[i].init(0, num_consumers * CLUSTERS);
+      init_barrier(&full[i], 0, 1);
+      init_barrier(&empty[i], 0, num_consumers * CLUSTERS);
     }
   }
-  // asm volatile("barrier.cluster.arrive;\n" : :);
-  // asm volatile("barrier.cluster.wait;\n" : :);
-
-  CUDABarrier::cluster_arrive();
-  CUDABarrier::cluster_wait();
+  asm volatile("barrier.cluster.arrive;\n" : :);
+  asm volatile("barrier.cluster.wait;\n" : :);
 
   Schedule<2, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
@@ -368,9 +262,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   // Producer
   if (wg_idx == 0) {
     constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-    // warpgroup_reg_dealloc<num_regs>();
-    CUDABarrier::warpgroup_reg_dealloc<num_regs>();
-
+    warpgroup_reg_dealloc<num_regs>();
     if (tid == 0) {
       int p = 0;
       int qidx = 0;
@@ -389,12 +281,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             qidx = 0;
             p ^= 1;
           }
-          // wait(&empty[qidx], p);
-          // expect_bytes(&full[qidx], (BK * BN + BK * BM) * sizeof(bf16));
+          wait(&empty[qidx], p);
 
-          barriers_empty[qidx].wait(p);
-          barriers_full[qidx].expect_bytes((BK * BN + BK * BM) * sizeof(bf16));
-
+          expect_bytes(&full[qidx], (BK * BN + BK * BM) * sizeof(bf16));
           if constexpr (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {
@@ -423,15 +312,12 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   } else {
     constexpr int num_regs =
         (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-    // warpgroup_reg_alloc<num_regs>();
-    CUDABarrier::warpgroup_reg_alloc<num_regs>();
-
+    warpgroup_reg_alloc<num_regs>();
     float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
     --wg_idx;
     for (int qidx = 0; qidx < QSIZE; ++qidx) {
       if (tid < CLUSTERS)
-        // arrive_cluster(&empty[qidx], tid);
-        barriers_empty[qidx].arrive_cluster(tid);
+        arrive_cluster(&empty[qidx], tid);
     }
     int p = 0;
     int qidx = 0;
@@ -444,10 +330,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           qidx = 0;
           p ^= 1;
         };
-        // wait(&full[qidx], p);
-        // warpgroup_arrive();
-        barriers_full[qidx].wait(p);
-        CUDABarrier::warpgroup_arrive();
+        wait(&full[qidx], p);
+        warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
@@ -474,15 +358,10 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
         }
-        // warpgroup_commit_batch();
-        // warpgroup_wait();
-        CUDABarrier::warpgroup_commit_batch();
-        CUDABarrier::warpgroup_wait();
-
+        warpgroup_commit_batch();
+        warpgroup_wait();
         if (tid < CLUSTERS)
-          // arrive_cluster(&empty[qidx], tid);
-          barriers_empty[qidx].arrive_cluster(tid);
-
+          arrive_cluster(&empty[qidx], tid);
         ++qidx;
       }
       for (int block_k_iter = 1; block_k_iter < num_blocks_k;
@@ -491,10 +370,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           qidx = 0;
           p ^= 1;
         };
-        // wait(&full[qidx], p);
-        // warpgroup_arrive();
-        barriers_full[qidx].wait(p);
-        CUDABarrier::warpgroup_arrive();
+        wait(&full[qidx], p);
+        warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
@@ -511,13 +388,10 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
         }
-        // warpgroup_commit_batch();
-        // warpgroup_wait();
-        CUDABarrier::warpgroup_commit_batch();
-        CUDABarrier::warpgroup_wait();
+        warpgroup_commit_batch();
+        warpgroup_wait();
         if (tid < CLUSTERS)
-          // arrive_cluster(&empty[qidx], tid);
-          barriers_empty[qidx].arrive_cluster(tid);
+          arrive_cluster(&empty[qidx], tid);
       }
 
       asm volatile("cp.async.bulk.wait_group 0;");
