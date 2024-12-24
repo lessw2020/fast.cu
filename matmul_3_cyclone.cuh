@@ -1,9 +1,10 @@
-#import "wgmma_utils.cuh"
+#import "wgmma.cuh"
+
 namespace M3 {
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
-namespace wg = wgmma_utils;
+namespace wg = wgmma;
 
 __device__ void warpgroup_arrive() {
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -66,15 +67,15 @@ template <int BM, int BN, int BK, int NUM_THREADS, bool DBG>
 __global__ void __launch_bounds__(NUM_THREADS)
     matmulKernel3(int M, int N, int K, bf16 *C, const CUtensorMap *tensorMapA,
                   const CUtensorMap *tensorMapB, int *DB) {
-  constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
+  constexpr int WGMMA_M = 64, WGMMA_K = 16;
   constexpr int B_WG_M = BM / (NUM_THREADS / 128);
   extern __shared__ SMem<BM, BN, BK> s;
   bf16 *sA = s.A;
   bf16 *sB = s.B;
-// Barriers cannot be in the struct and have to be declared this way
+
 #pragma nv_diag_suppress static_var_with_dynamic_init
   __shared__ barrier barA, barB;
-  float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
+  float d[B_WG_M / WGMMA_M][BN / 16][8];
   static_assert(sizeof(d) * NUM_THREADS == BM * BN * sizeof(float));
   memset(d, 0, sizeof(d));
 
@@ -129,8 +130,6 @@ __global__ void __launch_bounds__(NUM_THREADS)
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
 #pragma unroll
       for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-        // wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-        //                               &sB[k_it * WGMMA_K]);
         wg::WGMMAOp<WGMMA_M, BN, WGMMA_K>::multiply(
             &d[m_it][0][0], &wgmma_sA[k_it * WGMMA_K], &sB[k_it * WGMMA_K],
             scale_cfg, trans_cfg);
@@ -160,7 +159,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     for (uint32_t m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
       int yo = m_it * WGMMA_M + wg_idx * B_WG_M;
 #pragma unroll
-      for (uint32_t w = 0; w < WGMMA_N / 16; ++w) {
+      for (uint32_t w = 0; w < BN / 16; ++w) {
         int col = 16 * w + 2 * (tid % 4);
 #define IDX(i, j) ((j) * M + ((i) + yo))
 
