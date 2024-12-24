@@ -1,12 +1,11 @@
-#import "new_wgmma_utils.cuh";
-
+#import "wgmma_utils.cuh"; "
 namespace M3 {
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
-namespace wgmmu = new_wgmma_utils;
+namespace wgmmu = wgmma_utils;
 
-/* __device__ void warpgroup_arrive() {
+__device__ void warpgroup_arrive() {
   asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
@@ -18,7 +17,6 @@ template <int N> __device__ void warpgroup_wait() {
   static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
-*/
 
 template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap *tma_map, bf16 *gmem_ptr, int blocks_height,
@@ -59,6 +57,23 @@ allocate_and_create_tensor_map(bf16 *src, int blocks_height, int blocks_width) {
   return tma_map_d;
 }
 
+template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
+          int TransB>
+__device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
+  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
+                WGMMA_N == 192 || WGMMA_N == 256);
+  if constexpr (WGMMA_N == 256)
+    wgmmu::wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
+  if constexpr (WGMMA_N == 192)
+    wgmmu::wgmma192<1, 1, 1, 0, 0>(d, sA, sB);
+  if constexpr (WGMMA_N == 128)
+    wgmmu::wgmma128<1, 1, 1, 0, 0>(d, sA, sB);
+  if constexpr (WGMMA_N == 64)
+    wgmmu::wgmma64<1, 1, 1, 0, 0>(d, sA, sB);
+  if constexpr (WGMMA_N == 32)
+    wgmmu::wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
+}
+
 template <int BM, int BN, int BK> struct SMem {
   alignas(128) bf16 A[BM * BK];
   alignas(128) bf16 B[BK * BN];
@@ -96,9 +111,6 @@ __global__ void __launch_bounds__(NUM_THREADS)
   int sumLoad = 0, cntLoad = 0;
   int sumCompute = 0, cntCompute = 0;
   int sumStore = 0, cntStore = 0;
-
-  wgmmu::WGMMA<WGMMA_M, WGMMA_N, WGMMA_K> wgmma_op;
-
   for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter) {
     clock_t start = clock();
     // Load
@@ -127,22 +139,14 @@ __global__ void __launch_bounds__(NUM_THREADS)
 #pragma unroll
     for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
-      // Use accumulation mode based on iteration
-      auto mode = (block_k_iter == 0) ? wgmma::AccumulateMode::Init
-                                      : wgmma::AccumulateMode::Accumulate;
-
 #pragma unroll
       for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-        // wgmma_tc<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-        //                                  &sB[k_it * WGMMA_K]);
-        wgmma_op.multiply<1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                         &sB[k_it * WGMMA_K], mode);
+        wgmma_tc<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                         &sB[k_it * WGMMA_K]);
       }
     }
-    // warpgroup_commit_batch();
-    // warpgroup_wait<0>();
-    wgmma_op.commit_batch();
-    wgmma_op.wait_batch<>();
+    warpgroup_commit_batch();
+    warpgroup_wait<0>();
 
     if constexpr (DBG) {
       sumCompute += clock() - start;
