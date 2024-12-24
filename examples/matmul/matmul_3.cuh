@@ -123,26 +123,29 @@ __global__ void __launch_bounds__(NUM_THREADS)
     }
 
     // Compute
-    warpgroup_arrive();
+    // warpgroup_arrive();
 #pragma unroll
     for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
       // Use accumulation mode based on iteration
-      auto mode = (block_k_iter == 0) ? wgmma::AccumulateMode::Init
-                                      : wgmma::AccumulateMode::Accumulate;
 
 #pragma unroll
       for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
         // wgmma_tc<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
         //                                  &sB[k_it * WGMMA_K]);
-        wgmma_op.multiply<1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                         &sB[k_it * WGMMA_K], mode);
+        if (block_k_iter == 0) {
+          wgmma_op.init_multiply(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                 &sB[k_it * WGMMA_K]);
+        } else {
+          wgmma_op.accumulate_multiply(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                       &sB[k_it * WGMMA_K]);
+        }
       }
     }
     // warpgroup_commit_batch();
     // warpgroup_wait<0>();
     wgmma_op.commit_batch();
-    wgmma_op.wait_batch<>();
+    wgmma_op.wait_batch();
 
     if constexpr (DBG) {
       sumCompute += clock() - start;

@@ -1,15 +1,7 @@
 #pragma once
 // #include "register_manager.hpp"
 #include <cuda_bf16.h>
-
-namespace cuda {
-namespace wgmma {
-
-// WGMMA operation modes
-enum class AccumulateMode {
-  Init,      // First multiplication in sequence (d = a * b)
-  Accumulate // Subsequent multiplications (d += a * b)
-};
+namespace new_wgmma_utils {
 
 class WGMMABase {
 protected:
@@ -38,9 +30,10 @@ public:
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
   }
 
-  __device__ static void wait_batch(int N = 0) {
+  __device__ static void wait_batch() {
     // static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+    // asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
   }
 };
 
@@ -56,57 +49,47 @@ public:
   static constexpr int NumRows = N / 16;
   static constexpr int NumCols = 8;
 
-  // Standard multiply with optional accumulation mode
-  template <int ScaleD = 1, int ScaleA = 1, int ScaleB = 1, int TransA = 0,
-            int TransB = 0>
-  __device__ void multiply(float d[NumRows][NumCols], bf16 *sA, bf16 *sB,
-                           AccumulateMode mode = AccumulateMode::Accumulate) {
-    // Adjust ScaleD based on accumulation mode
-    constexpr int effectiveScaleD = (mode == AccumulateMode::Init) ? 0 : ScaleD;
-
+  // Initialize multiplication (ScaleD = 0)
+  template <int ScaleA = 1, int ScaleB = 1, int TransA = 0, int TransB = 0>
+  __device__ void init_multiply(float d[NumRows][NumCols], bf16 *sA, bf16 *sB) {
     uint64_t desc_a = make_smem_desc(sA);
     uint64_t desc_b = make_smem_desc(sB);
 
     if constexpr (N == 256) {
-      multiply_256<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                    desc_b);
+      multiply_256<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     } else if constexpr (N == 192) {
-      multiply_192<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                    desc_b);
+      multiply_192<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     } else if constexpr (N == 128) {
-      multiply_128<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                    desc_b);
+      multiply_128<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     } else if constexpr (N == 64) {
-      multiply_64<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                   desc_b);
+      multiply_64<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     } else if constexpr (N == 32) {
-      multiply_32<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                   desc_b);
+      multiply_32<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     } else if constexpr (N == 16) {
-      multiply_16<effectiveScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a,
-                                                                   desc_b);
+      multiply_16<0, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     }
   }
 
-  // Batch multiply - execute multiple multiplications in sequence
-  template <int ScaleD = 1, int ScaleA = 1, int ScaleB = 1, int TransA = 0,
-            int TransB = 0>
-  __device__ void multiply_batch(float d[NumRows][NumCols], bf16 *sA, bf16 *sB,
-                                 int batch_size) {
-    fence();
+  // Accumulate multiplication (ScaleD = 1)
+  template <int ScaleA = 1, int ScaleB = 1, int TransA = 0, int TransB = 0>
+  __device__ void accumulate_multiply(float d[NumRows][NumCols], bf16 *sA,
+                                      bf16 *sB) {
+    uint64_t desc_a = make_smem_desc(sA);
+    uint64_t desc_b = make_smem_desc(sB);
 
-    // First multiplication initializes
-    multiply<0, ScaleA, ScaleB, TransA, TransB>(d, &sA[0], &sB[0],
-                                                AccumulateMode::Init);
-
-    // Subsequent multiplications accumulate
-    for (int i = 1; i < batch_size; i++) {
-      multiply<1, ScaleA, ScaleB, TransA, TransB>(
-          d, &sA[i * M * K], &sB[i * K * N], AccumulateMode::Accumulate);
+    if constexpr (N == 256) {
+      multiply_256<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    } else if constexpr (N == 192) {
+      multiply_192<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    } else if constexpr (N == 128) {
+      multiply_128<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    } else if constexpr (N == 64) {
+      multiply_64<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    } else if constexpr (N == 32) {
+      multiply_32<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    } else if constexpr (N == 16) {
+      multiply_16<1, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
     }
-
-    commit_batch();
-    wait_batch<0>();
   }
 
 private:
@@ -322,5 +305,4 @@ private:
   }
 };
 
-} // namespace wgmma
-} // namespace cuda
+} // namespace new_wgmma_utils
