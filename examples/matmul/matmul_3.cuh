@@ -58,21 +58,20 @@ allocate_and_create_tensor_map(bf16 *src, int blocks_height, int blocks_width) {
   return tma_map_d;
 }
 
-template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
-          int TransB>
+template <int WGMMA_N, typename Config = wgmmu::DefaultConfig>
 __device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
   static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
                 WGMMA_N == 192 || WGMMA_N == 256);
   if constexpr (WGMMA_N == 256)
-    wgmmu::wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
+    wgmmu::wgmma256<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 192)
-    wgmmu::wgmma192<1, 1, 1, 0, 0>(d, sA, sB);
+    wgmmu::wgmma192<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 128)
-    wgmmu::wgmma128<1, 1, 1, 0, 0>(d, sA, sB);
+    wgmmu::wgmma128<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 64)
-    wgmmu::wgmma64<1, 1, 1, 0, 0>(d, sA, sB);
+    wgmmu::wgmma64<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 32)
-    wgmmu::wgmma32<1, 1, 1, 0, 0>(d, sA, sB);
+    wgmmu::wgmma32<Config>(d, sA, sB);
 }
 
 template <int BM, int BN, int BK> struct SMem {
@@ -80,7 +79,8 @@ template <int BM, int BN, int BK> struct SMem {
   alignas(128) bf16 B[BK * BN];
 };
 
-template <int BM, int BN, int BK, int NUM_THREADS, bool DBG>
+template <int BM, int BN, int BK, int NUM_THREADS, bool DBG,
+          typename Config = wgmmu::DefaultConfig>
 __global__ void __launch_bounds__(NUM_THREADS)
     matmulKernel3(int M, int N, int K, bf16 *C, const CUtensorMap *tensorMapA,
                   const CUtensorMap *tensorMapB, int *DB) {
@@ -142,8 +142,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
 #pragma unroll
       for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-        wgmma_tc<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                         &sB[k_it * WGMMA_K]);
+        wgmma_tc<WGMMA_N, Config>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                  &sB[k_it * WGMMA_K]);
       }
     }
     warpgroup_commit_batch();
@@ -202,6 +202,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
   }
 }
 
+template <typename Config = wgmmu::DefaultConfig>
 void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   constexpr int BM = 128;
   constexpr int BN = 128;
@@ -217,8 +218,8 @@ void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   }
   // Assert cached values are of same size
   assert(M == _prev_m && N == _prev_n && K == _prev_k);
-  auto *kernel = DB ? matmulKernel3<BM, BN, BK, NUM_THREADS, true>
-                    : matmulKernel3<BM, BN, BK, NUM_THREADS, false>;
+  auto *kernel = DB ? matmulKernel3<BM, BN, BK, NUM_THREADS, true, Config>
+                    : matmulKernel3<BM, BN, BK, NUM_THREADS, false, Config>;
   size_t sMemSize = sizeof(SMem<BM, BN, BK>);
   cudaCheck(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));

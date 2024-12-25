@@ -2,6 +2,32 @@
 
 namespace wgmma_utils {
 
+// Parameter enums for configuration
+enum class Scale { None = 1 };
+
+enum class Transform { None = 0, Transpose = 1 };
+
+// Configuration template
+template <Scale D, Scale A, Scale B, Transform TransA, Transform TransB>
+struct WGMMAConfig {
+  static constexpr int ScaleD = static_cast<int>(D);
+  static constexpr int ScaleA = static_cast<int>(A);
+  static constexpr int ScaleB = static_cast<int>(B);
+  static constexpr int TransformA = static_cast<int>(TransA);
+  static constexpr int TransformB = static_cast<int>(TransB);
+};
+
+// configurations
+using DefaultConfig = WGMMAConfig<Scale::None, Scale::None, Scale::None,
+                                  Transform::None, Transform::None>;
+using TransposedAConfig = WGMMAConfig<Scale::None, Scale::None, Scale::None,
+                                      Transform::Transpose, Transform::None>;
+using TransposedBConfig = WGMMAConfig<Scale::None, Scale::None, Scale::None,
+                                      Transform::None, Transform::Transpose>;
+using TransposedABConfig =
+    WGMMAConfig<Scale::None, Scale::None, Scale::None, Transform::Transpose,
+                Transform::Transpose>;
+
 // Single Descriptor
 class WGMMADescriptor {
 private:
@@ -33,9 +59,9 @@ public:
 };
 
 // suite of wgmma ptx calls
-// suite of wgmma ptx calls
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+// template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -93,12 +119,17 @@ __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
                  "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]),
                  "+f"(d[15][4]), "+f"(d[15][5]), "+f"(d[15][6]), "+f"(d[15][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
+
+  //: "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+  //  "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+  //  "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -144,12 +175,13 @@ __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[10][4]), "+f"(d[10][5]), "+f"(d[10][6]), "+f"(d[10][7]),
                  "+f"(d[11][0]), "+f"(d[11][1]), "+f"(d[11][2]), "+f"(d[11][3]),
                  "+f"(d[11][4]), "+f"(d[11][5]), "+f"(d[11][6]), "+f"(d[11][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -183,12 +215,13 @@ __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[6][4]), "+f"(d[6][5]), "+f"(d[6][6]), "+f"(d[6][7]),
                  "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
                  "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -210,12 +243,13 @@ __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
                  "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]),
                  "+f"(d[3][4]), "+f"(d[3][5]), "+f"(d[3][6]), "+f"(d[3][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -231,12 +265,13 @@ __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7]),
                  "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
                  "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+template <typename Config = DefaultConfig>
 __device__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
   uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
@@ -249,9 +284,10 @@ __device__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB) {
                "}\n"
                : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]),
                  "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-                 "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
+                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
+                 "n"(int32_t(Config::TransformA)),
+                 "n"(int32_t(Config::TransformB)));
 }
 
 } // end namespace wgmma_utils
