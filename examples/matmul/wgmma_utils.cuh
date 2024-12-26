@@ -38,10 +38,10 @@ template <typename Config> struct ValidateWGMMAConfig {
                 "ScaleA must be in range [0,4]");
   static_assert(Config::ScaleB >= 0 && Config::ScaleB <= 4,
                 "ScaleB must be in range [0,4]");
-  static_assert(Config::TransA == 0 || Config::TransA == 1,
-                "TransA must be 0 or 1");
-  static_assert(Config::TransB == 0 || Config::TransB == 1,
-                "TransB must be 0 or 1");
+  static_assert(Config::TransformA == 0 || Config::TransformA == 1,
+                "TransformA must be 0 or 1");
+  static_assert(Config::TransformB == 0 || Config::TransformB == 1,
+                "TransformB must be 0 or 1");
 };
 
 // Updated DefaultConfig with validation
@@ -49,8 +49,8 @@ struct DefaultConfig {
   static constexpr int ScaleD = 1;
   static constexpr int ScaleA = 1;
   static constexpr int ScaleB = 1;
-  static constexpr int TransA = 0;
-  static constexpr int TransB = 0;
+  static constexpr int TransformA = 0;
+  static constexpr int TransformB = 0;
 
   // Validate configuration at compile time
   // static constexpr bool IsValid = ValidateWGMMAConfig<DefaultConfig>::value;
@@ -72,20 +72,20 @@ __device__ __forceinline__ void wgmma_dispatch(float d[WGMMA_N / 16][8],
   // static_assert(is_valid_wgmma_n<WGMMA_N>::value, "Invalid WGMMA_N value");
 
   if constexpr (WGMMA_N == 256) {
-    wgmma256<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransA,
-             Config::TransB>(d, sA, sB);
+    wgmma256<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
+             Config::TransformB>(d, sA, sB);
   } else if constexpr (WGMMA_N == 192) {
-    wgmma192<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransA,
-             Config::TransB>(d, sA, sB);
+    wgmma192<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
+             Config::TransformB>(d, sA, sB);
   } else if constexpr (WGMMA_N == 128) {
-    wgmma128<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransA,
-             Config::TransB>(d, sA, sB);
+    wgmma128<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
+             Config::TransformB>(d, sA, sB);
   } else if constexpr (WGMMA_N == 64) {
-    wgmma64<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransA,
-            Config::TransB>(d, sA, sB);
+    wgmma64<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
+            Config::TransformB>(d, sA, sB);
   } else if constexpr (WGMMA_N == 32) {
-    wgmma32<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransA,
-            Config::TransB>(d, sA, sB);
+    wgmma32<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
+            Config::TransformB>(d, sA, sB);
   }
 }
 
@@ -94,8 +94,8 @@ struct TransposedAConfig {
   static constexpr int ScaleD = 1;
   static constexpr int ScaleA = 1;
   static constexpr int ScaleB = 1;
-  static constexpr int TransA = 1; // Transpose A
-  static constexpr int TransB = 0;
+  static constexpr int TransformA = 1; // Transpose A
+  static constexpr int TransformB = 0;
 };
 
 // Validate configuration at compile time
@@ -134,7 +134,7 @@ public:
 
 // suite of wgmma ptx calls
 
-// template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
+// template <int ScaleD, int ScaleA, int ScaleB, int TransformA, int TransformB>
 template <typename Config = DefaultConfig>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
@@ -200,7 +200,7 @@ __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
 
   //: "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
   //  "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-  //  "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+  //  "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
 template <typename Config = DefaultConfig>

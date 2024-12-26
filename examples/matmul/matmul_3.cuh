@@ -12,7 +12,7 @@ struct StandardConfig : public DefaultConfig {
 };
 
 struct TransposedConfig : public DefaultConfig {
-  static constexpr int TransA = 1; // Transpose matrix A
+  static constexpr int TransformA = 1; // Transpose matrix A
 };
 
 template <int BlockMajorSize, int BlockMinorSize>
