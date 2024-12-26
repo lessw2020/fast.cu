@@ -7,6 +7,14 @@ namespace cde = cuda::device::experimental;
 namespace wgmmu = wgmma_utils;
 using namespace wgmmu;
 
+struct StandardConfig : public DefaultConfig {
+  // Use default settings
+};
+
+struct TransposedConfig : public DefaultConfig {
+  static constexpr int TransA = 1; // Transpose matrix A
+};
+
 template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap *tma_map, bf16 *gmem_ptr, int blocks_height,
                        int blocks_width) {
@@ -51,16 +59,12 @@ template <int BM, int BN, int BK> struct SMem {
   alignas(128) bf16 B[BK * BN];
 };
 
-template <int WGMMA_N, typename Config = wgmmu::DefaultConfig>
-__device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
-  wgmmu::wgmma_dispatch<WGMMA_N, Config>(d, sA, sB);
-}
-
 template <int BM, int BN, int BK, int NUM_THREADS, bool DBG,
-          typename Config = wgmmu::DefaultConfig>
-__global__ void __launch_bounds__(NUM_THREADS)
-    matmulKernel3(int M, int N, int K, bf16 *C, const CUtensorMap *tensorMapA,
-                  const CUtensorMap *tensorMapB, int *DB) {
+          typename Config = StandardConfig>
+    > __global__ void __launch_bounds__(NUM_THREADS)
+          matmulKernel3(int M, int N, int K, bf16 *C,
+                        const CUtensorMap *tensorMapA,
+                        const CUtensorMap *tensorMapB, int *DB) {
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int B_WG_M = BM / (NUM_THREADS / 128);
   extern __shared__ SMem<BM, BN, BK> s;
@@ -120,8 +124,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
 #pragma unroll
       for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-        wgmma_tc<WGMMA_N, Config>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                  &sB[k_it * WGMMA_K]);
+        wgmma_dispatch<WGMMA_N, Config>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                        &sB[k_it * WGMMA_K]);
       }
     }
     // warpgroup_commit_batch();
@@ -181,7 +185,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
   }
 }
 
-template <typename Config = wgmmu::DefaultConfig>
+template <typename Config = StandardConfig>
 void runKernel3(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   constexpr int BM = 128;
   constexpr int BN = 128;
