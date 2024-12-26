@@ -60,11 +60,10 @@ template <int BM, int BN, int BK> struct SMem {
 };
 
 template <int BM, int BN, int BK, int NUM_THREADS, bool DBG,
-          typename Config = StandardConfig>
-    > __global__ void __launch_bounds__(NUM_THREADS)
-          matmulKernel3(int M, int N, int K, bf16 *C,
-                        const CUtensorMap *tensorMapA,
-                        const CUtensorMap *tensorMapB, int *DB) {
+          typename Config = DefaultConfig>
+__global__ void __launch_bounds__(NUM_THREADS)
+    matmulKernel3(int M, int N, int K, bf16 *C, const CUtensorMap *tensorMapA,
+                  const CUtensorMap *tensorMapB, int *DB) {
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int B_WG_M = BM / (NUM_THREADS / 128);
   extern __shared__ SMem<BM, BN, BK> s;

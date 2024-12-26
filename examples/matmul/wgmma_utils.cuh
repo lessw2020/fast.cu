@@ -17,20 +17,15 @@ struct SyncOps {
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
   }
 
-  // combined commit and wait operation - these are usually paired so save a
-  // function call
   template <int N = 0> __device__ static inline void wg_commit_and_wait() {
-    // commit_group();
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-    // wait_group<N>();
     static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+    asm volatile("wgmma.commit_group.sync.aligned;\n"
+                 "wgmma.wait_group.sync.aligned %0;\n" ::"n"(N)
+                 : "memory");
   }
 };
 
-//
-
-// Verify configuration at compile time
+// Verify configuration at compile time with more detailed validation
 template <typename Config> struct ValidateWGMMAConfig {
   static_assert(Config::ScaleD >= 0 && Config::ScaleD <= 4,
                 "ScaleD must be in range [0,4]");
@@ -42,9 +37,11 @@ template <typename Config> struct ValidateWGMMAConfig {
                 "TransformA must be 0 or 1");
   static_assert(Config::TransformB == 0 || Config::TransformB == 1,
                 "TransformB must be 0 or 1");
+
+  // Add validation result
+  static constexpr bool IsValid = true;
 };
 
-// Updated DefaultConfig with validation
 struct DefaultConfig {
   static constexpr int ScaleD = 1;
   static constexpr int ScaleA = 1;
@@ -52,57 +49,45 @@ struct DefaultConfig {
   static constexpr int TransformA = 0;
   static constexpr int TransformB = 0;
 
-  // Validate configuration at compile time
-  // static constexpr bool IsValid = ValidateWGMMAConfig<DefaultConfig>::value;
+  // Force validation at compile time
+  static_assert(ValidateWGMMAConfig<DefaultConfig>::IsValid,
+                "Invalid DefaultConfig parameters");
 };
 
-// Type trait to validate WGMMA_N values
-template <int N> struct is_valid_wgmma_n : std::false_type {};
+// Type trait to validate WGMMA_N values with better error messages
+template <int N> struct is_valid_wgmma_n : std::false_type {
+  static_assert(N == 16 || N == 32 || N == 64 || N == 128 || N == 192 ||
+                    N == 256,
+                "WGMMA_N must be one of: 16, 32, 64, 128, 192, or 256");
+};
 
+// Forward declarations of all WGMMA functions
+template <typename Config>
+__device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB);
+
+template <> struct is_valid_wgmma_n<16> : std::true_type {};
 template <> struct is_valid_wgmma_n<32> : std::true_type {};
 template <> struct is_valid_wgmma_n<64> : std::true_type {};
 template <> struct is_valid_wgmma_n<128> : std::true_type {};
 template <> struct is_valid_wgmma_n<192> : std::true_type {};
 template <> struct is_valid_wgmma_n<256> : std::true_type {};
 
-// Main dispatch function
-template <int WGMMA_N, typename Config = DefaultConfig>
-__device__ __forceinline__ void wgmma_dispatch(float d[WGMMA_N / 16][8],
-                                               bf16 *sA, bf16 *sB) {
-  // static_assert(is_valid_wgmma_n<WGMMA_N>::value, "Invalid WGMMA_N value");
-
-  if constexpr (WGMMA_N == 256) {
-    wgmma256<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
-             Config::TransformB>(d, sA, sB);
-  } else if constexpr (WGMMA_N == 192) {
-    wgmma192<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
-             Config::TransformB>(d, sA, sB);
-  } else if constexpr (WGMMA_N == 128) {
-    wgmma128<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
-             Config::TransformB>(d, sA, sB);
-  } else if constexpr (WGMMA_N == 64) {
-    wgmma64<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
-            Config::TransformB>(d, sA, sB);
-  } else if constexpr (WGMMA_N == 32) {
-    wgmma32<Config::ScaleD, Config::ScaleA, Config::ScaleB, Config::TransformA,
-            Config::TransformB>(d, sA, sB);
-  }
-}
-
-// Custom configuration
-struct TransposedAConfig {
-  static constexpr int ScaleD = 1;
-  static constexpr int ScaleA = 1;
-  static constexpr int ScaleB = 1;
-  static constexpr int TransformA = 1; // Transpose A
-  static constexpr int TransformB = 0;
-};
-
-// Validate configuration at compile time
-static constexpr bool IsValid = ValidateWGMMAConfig<TransposedAConfig>::value;
-
-//
-// Single Descriptor
+// Shared memory descriptor handling
 class WGMMADescriptor {
 private:
   static constexpr uint64_t SWIZZLE_BITS_128 = 1llu << 62;
@@ -119,7 +104,6 @@ public:
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
     uint64_t desc = 0x0000000000000000;
 
-    // Encode parameters with named constants for clarity
     static constexpr uint64_t STRIDE = 16;
     static constexpr uint64_t BLOCK_SIZE = 1024;
 
@@ -132,6 +116,28 @@ public:
   }
 };
 
+// Main dispatch function updated to include wgmma16
+template <int WGMMA_N, typename Config = DefaultConfig>
+__device__ __forceinline__ void wgmma_dispatch(float d[WGMMA_N / 16][8],
+                                               bf16 *sA, bf16 *sB) {
+  static_assert(is_valid_wgmma_n<WGMMA_N>::value, "Invalid WGMMA_N value");
+  static_assert(ValidateWGMMAConfig<Config>::IsValid,
+                "Invalid WGMMA configuration");
+
+  if constexpr (WGMMA_N == 256) {
+    wgmma256<Config>(d, sA, sB);
+  } else if constexpr (WGMMA_N == 192) {
+    wgmma192<Config>(d, sA, sB);
+  } else if constexpr (WGMMA_N == 128) {
+    wgmma128<Config>(d, sA, sB);
+  } else if constexpr (WGMMA_N == 64) {
+    wgmma64<Config>(d, sA, sB);
+  } else if constexpr (WGMMA_N == 32) {
+    wgmma32<Config>(d, sA, sB);
+  } else if constexpr (WGMMA_N == 16) {
+    wgmma16<Config>(d, sA, sB);
+  }
+}
 // suite of wgmma ptx calls
 
 // template <int ScaleD, int ScaleA, int ScaleB, int TransformA, int TransformB>
