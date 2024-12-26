@@ -46,26 +46,15 @@ allocate_and_create_tensor_map(bf16 *src, int blocks_height, int blocks_width) {
   return tma_map_d;
 }
 
-template <int WGMMA_N, typename Config = wgmmu::DefaultConfig>
-__device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
-  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
-                WGMMA_N == 192 || WGMMA_N == 256);
-  if constexpr (WGMMA_N == 256)
-    wgmma256<Config>(d, sA, sB);
-  if constexpr (WGMMA_N == 192)
-    wgmma192<Config>(d, sA, sB);
-  if constexpr (WGMMA_N == 128)
-    wgmma128<Config>(d, sA, sB);
-  if constexpr (WGMMA_N == 64)
-    wgmma64<Config>(d, sA, sB);
-  if constexpr (WGMMA_N == 32)
-    wgmma32<Config>(d, sA, sB);
-}
-
 template <int BM, int BN, int BK> struct SMem {
   alignas(128) bf16 A[BM * BK];
   alignas(128) bf16 B[BK * BN];
 };
+
+template <int WGMMA_N, typename Config = wgmmu::DefaultConfig>
+__device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
+  wgmmu::wgmma_dispatch<WGMMA_N, Config>(d, sA, sB);
+}
 
 template <int BM, int BN, int BK, int NUM_THREADS, bool DBG,
           typename Config = wgmmu::DefaultConfig>

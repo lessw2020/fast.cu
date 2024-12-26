@@ -84,6 +84,34 @@ public:
   }
 };
 
+// Compile-time size dispatch
+template <int N, typename Config> struct WGMMADispatcher {
+  // template <typename Config>
+  __device__ static inline void dispatch(float d[N / 16][8], bf16 *sA,
+                                         bf16 *sB) {
+    static_assert(N == 32 || N == 64 || N == 128 || N == 192 || N == 256,
+                  "WGMMA size must be one of: 32, 64, 128, 192, 256");
+
+    if constexpr (N == 256) {
+      wgmma256<Config>(d, sA, sB);
+    } else if constexpr (N == 192) {
+      wgmma192<Config>(d, sA, sB);
+    } else if constexpr (N == 128) {
+      wgmma128<Config>(d, sA, sB);
+    } else if constexpr (N == 64) {
+      wgmma64<Config>(d, sA, sB);
+    } else if constexpr (N == 32) {
+      wgmma32<Config>(d, sA, sB);
+    }
+  }
+};
+
+// Helper function to make the dispatcher easier to use
+template <int N, typename Config = DefaultConfig>
+__device__ inline void wgmma_dispatch(float d[N / 16][8], bf16 *sA, bf16 *sB) {
+  WGMMADispatcher<N>::template dispatch<Config>(d, sA, sB);
+}
+
 // suite of wgmma ptx calls
 
 // template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
