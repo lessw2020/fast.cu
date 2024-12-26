@@ -5,19 +5,7 @@ namespace M3 {
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 namespace wgmmu = wgmma_utils;
-
-__device__ void warpgroup_arrive() {
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-}
-
-__device__ void warpgroup_commit_batch() {
-  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-}
-
-template <int N> __device__ void warpgroup_wait() {
-  static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-}
+using namespace wgmmu;
 
 template <int BlockMajorSize, int BlockMinorSize>
 void create_tensor_map(CUtensorMap *tma_map, bf16 *gmem_ptr, int blocks_height,
@@ -63,15 +51,15 @@ __device__ inline void wgmma_tc(float d[WGMMA_N / 16][8], bf16 *sA, bf16 *sB) {
   static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
                 WGMMA_N == 192 || WGMMA_N == 256);
   if constexpr (WGMMA_N == 256)
-    wgmmu::wgmma256<Config>(d, sA, sB);
+    wgmma256<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 192)
-    wgmmu::wgmma192<Config>(d, sA, sB);
+    wgmma192<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 128)
-    wgmmu::wgmma128<Config>(d, sA, sB);
+    wgmma128<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 64)
-    wgmmu::wgmma64<Config>(d, sA, sB);
+    wgmma64<Config>(d, sA, sB);
   if constexpr (WGMMA_N == 32)
-    wgmmu::wgmma32<Config>(d, sA, sB);
+    wgmma32<Config>(d, sA, sB);
 }
 
 template <int BM, int BN, int BK> struct SMem {
@@ -136,7 +124,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
     }
 
     // Compute
-    warpgroup_arrive();
+    // warpgroup_arrive();
+    SyncOps::wg_arrive();
 #pragma unroll
     for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
       bf16 *wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
@@ -146,8 +135,9 @@ __global__ void __launch_bounds__(NUM_THREADS)
                                   &sB[k_it * WGMMA_K]);
       }
     }
-    warpgroup_commit_batch();
-    warpgroup_wait<0>();
+    // warpgroup_commit_batch();
+    // warpgroup_wait<0>();
+    SyncOps::wg_commit_and_wait<0>();
 
     if constexpr (DBG) {
       sumCompute += clock() - start;

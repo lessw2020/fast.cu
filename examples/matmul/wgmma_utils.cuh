@@ -2,6 +2,32 @@
 
 namespace wgmma_utils {
 
+// WGMMA Barrier Operations
+struct SyncOps {
+  __device__ static inline void wg_arrive() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  }
+
+  __device__ static inline void wg_commit_group() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+  }
+
+  template <int N> __device__ static inline void wg_wait_group() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+  }
+
+  // combined commit and wait operation - these are usually paired so save a
+  // function call
+  template <int N = 0> __device__ static inline void wg_commit_and_wait() {
+    // commit_group();
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+    // wait_group<N>();
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+  }
+};
+
 // Parameter enums for configuration
 enum class Scale { None = 1 };
 
