@@ -117,7 +117,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmulKernel4(
 }
 
 // Helper function to create tensor maps and launch kernel
-void runMatmul4(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void runKernel4(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
   constexpr int BM = 128;
   constexpr int BN = 128;
   constexpr int BK = 64;
