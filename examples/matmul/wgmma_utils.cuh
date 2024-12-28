@@ -6,10 +6,6 @@ namespace wgmma_utils {
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-// Forward declare dispatch function
-template <int N>
-__device__ void wgmma_dispatch(float d[N / 16][8], bf16 *sA, bf16 *sB);
-
 // Configuration validation
 template <typename Config> struct ValidateWGMMAConfig {
   static_assert(Config::ScaleD >= 0 && Config::ScaleD <= 4,
@@ -25,7 +21,7 @@ template <typename Config> struct ValidateWGMMAConfig {
   static constexpr bool IsValid = true;
 };
 
-// Default configuration
+// Default configuration - only define it once
 struct DefaultConfig {
   static constexpr int ScaleD = 1;
   static constexpr int ScaleA = 1;
@@ -36,21 +32,7 @@ struct DefaultConfig {
                 "Invalid DefaultConfig parameters");
 };
 
-// Parameter validation
-
-template <typename T, int BM, int BN, int BK, int QSIZE>
-struct ValidateParameters {
-  static_assert(BM > 0 && BM % 64 == 0,
-                "BM must be positive and aligned to 64");
-  static_assert(BN > 0 && BN % 16 == 0,
-                "BN must be positive and aligned to 16");
-  static_assert(BK > 0 && BK % 16 == 0,
-                "BK must be positive and aligned to 16");
-  static_assert(QSIZE > 0 && QSIZE <= 8, "QSIZE must be between 1 and 8");
-  static_assert(std::is_same_v<T, bf16>, "Only bf16 data type is supported");
-};
-
-// Forward declarations
+// Forward declarations of WGMMA functions
 template <typename Config>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB);
 
@@ -68,6 +50,23 @@ __device__ __forceinline__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB);
 
 template <typename Config>
 __device__ __forceinline__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB);
+
+// Main dispatch function
+template <int N>
+__device__ void wgmma_dispatch(float d[N / 16][8], bf16 *sA, bf16 *sB);
+
+// Parameter validation
+template <typename T, int BM, int BN, int BK, int QSIZE>
+struct ValidateParameters {
+  static_assert(BM > 0 && BM % 64 == 0,
+                "BM must be positive and aligned to 64");
+  static_assert(BN > 0 && BN % 16 == 0,
+                "BN must be positive and aligned to 16");
+  static_assert(BK > 0 && BK % 16 == 0,
+                "BK must be positive and aligned to 16");
+  static_assert(QSIZE > 0 && QSIZE <= 8, "QSIZE must be between 1 and 8");
+  static_assert(std::is_same_v<T, bf16>, "Only bf16 data type is supported");
+};
 
 class BarrierSystem {
 private:
@@ -250,13 +249,14 @@ struct ProducerConsumerSystem {
         buffer->produce_begin(qidx, block_k);
 
         barrier::arrival_token token;
+        // Fix tensor map calls
         cde::cp_async_bulk_tensor_2d_global_to_shared(
             buffer->get_A(qidx), state.tensorMapA, block_k * BK,
-            state.block_m * BM);
+            state.block_m * BM, BK, BM); // Add missing dimensions
 
         cde::cp_async_bulk_tensor_2d_global_to_shared(
             buffer->get_B(qidx), state.tensorMapB, block_k * BK,
-            state.block_n * BN);
+            state.block_n * BN, BK, BN); // Add missing dimensions
 
         buffer->produce_end(qidx, token);
       }
@@ -594,7 +594,7 @@ __device__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::TransformA)),
                  "n"(int32_t(Config::TransformB)));
 }
-
+// Template specializations for wgmma_dispatch
 template <>
 __device__ void wgmma_dispatch<256>(float d[16][8], bf16 *sA, bf16 *sB) {
   wgmma256<DefaultConfig>(d, sA, sB);
