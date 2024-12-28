@@ -1,12 +1,40 @@
 #pragma once
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 namespace wgmma_utils {
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-// Forward declare WGMMA dispatch function
+// Forward declare dispatch function
 template <int N>
 __device__ void wgmma_dispatch(float d[N / 16][8], bf16 *sA, bf16 *sB);
+
+// Configuration validation
+template <typename Config> struct ValidateWGMMAConfig {
+  static_assert(Config::ScaleD >= 0 && Config::ScaleD <= 4,
+                "ScaleD must be in range [0,4]");
+  static_assert(Config::ScaleA >= 0 && Config::ScaleA <= 4,
+                "ScaleA must be in range [0,4]");
+  static_assert(Config::ScaleB >= 0 && Config::ScaleB <= 4,
+                "ScaleB must be in range [0,4]");
+  static_assert(Config::TransformA == 0 || Config::TransformA == 1,
+                "TransformA must be 0 or 1");
+  static_assert(Config::TransformB == 0 || Config::TransformB == 1,
+                "TransformB must be 0 or 1");
+  static constexpr bool IsValid = true;
+};
+
+// Default configuration
+struct DefaultConfig {
+  static constexpr int ScaleD = 1;
+  static constexpr int ScaleA = 1;
+  static constexpr int ScaleB = 1;
+  static constexpr int TransformA = 0;
+  static constexpr int TransformB = 0;
+  static_assert(ValidateWGMMAConfig<DefaultConfig>::IsValid,
+                "Invalid DefaultConfig parameters");
+};
 
 // Parameter validation
 
@@ -21,6 +49,25 @@ struct ValidateParameters {
   static_assert(QSIZE > 0 && QSIZE <= 8, "QSIZE must be between 1 and 8");
   static_assert(std::is_same_v<T, bf16>, "Only bf16 data type is supported");
 };
+
+// Forward declarations
+template <typename Config>
+__device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB);
+
+template <typename Config>
+__device__ __forceinline__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB);
 
 class BarrierSystem {
 private:
@@ -80,9 +127,11 @@ template <typename T, int BM, int BN, int BK, int QSIZE> struct CircularBuffer {
     barriers[qidx].arrive_and_wait_empty();
   }
 
+  // Use proper barrier_arrive_tx with both token parameters
+  // cuda::device::barrier_arrive_tx(barriers[qidx].arrive_full(), token);
   __device__ void produce_end(int qidx, barrier::arrival_token token) {
-    // Use proper barrier_arrive_tx with both token parameters
-    cuda::device::barrier_arrive_tx(barriers[qidx].arrive_full(), token);
+    cuda::device::barrier_arrive_tx<cuda::thread_scope_block>(
+        barriers[qidx].arrive_full(), std::move(token));
   }
 
   __device__ void consume_begin(int &qidx, int block_k) {
@@ -245,23 +294,6 @@ struct ProducerConsumerSystem {
       buffer->consume_end(qidx);
     }
   }
-};
-
-// Verify configuration at compile time with more detailed validation
-template <typename Config> struct ValidateWGMMAConfig {
-  static_assert(Config::ScaleD >= 0 && Config::ScaleD <= 4,
-                "ScaleD must be in range [0,4]");
-  static_assert(Config::ScaleA >= 0 && Config::ScaleA <= 4,
-                "ScaleA must be in range [0,4]");
-  static_assert(Config::ScaleB >= 0 && Config::ScaleB <= 4,
-                "ScaleB must be in range [0,4]");
-  static_assert(Config::TransformA == 0 || Config::TransformA == 1,
-                "TransformA must be 0 or 1");
-  static_assert(Config::TransformB == 0 || Config::TransformB == 1,
-                "TransformB must be 0 or 1");
-
-  // Add validation result
-  static constexpr bool IsValid = true;
 };
 
 struct DefaultConfig {
@@ -561,6 +593,31 @@ __device__ void wgmma16(float d[1][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
                  "n"(int32_t(Config::TransformA)),
                  "n"(int32_t(Config::TransformB)));
+}
+
+template <>
+__device__ void wgmma_dispatch<256>(float d[16][8], bf16 *sA, bf16 *sB) {
+  wgmma256<DefaultConfig>(d, sA, sB);
+}
+
+template <>
+__device__ void wgmma_dispatch<128>(float d[8][8], bf16 *sA, bf16 *sB) {
+  wgmma128<DefaultConfig>(d, sA, sB);
+}
+
+template <>
+__device__ void wgmma_dispatch<64>(float d[4][8], bf16 *sA, bf16 *sB) {
+  wgmma64<DefaultConfig>(d, sA, sB);
+}
+
+template <>
+__device__ void wgmma_dispatch<32>(float d[2][8], bf16 *sA, bf16 *sB) {
+  wgmma32<DefaultConfig>(d, sA, sB);
+}
+
+template <>
+__device__ void wgmma_dispatch<16>(float d[1][8], bf16 *sA, bf16 *sB) {
+  wgmma16<DefaultConfig>(d, sA, sB);
 }
 
 } // namespace wgmma_utils
