@@ -76,21 +76,6 @@ template <uint32_t RegCount> __device__ void warpgroup_reg_dealloc() {
   asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
-__device__ static __forceinline__ void
-init_barrier(uint64_t *bar, int thread_count, int transaction_count) {
-  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
-               "r"(thread_count + transaction_count));
-}
-
-__device__ static __forceinline__ void expect_bytes(uint64_t *bar,
-                                                    uint32_t bytes) {
-  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile(
-      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar_ptr),
-      "r"(bytes));
-}
-
 __device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
   uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile("{\n"
@@ -204,8 +189,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   if (threadIdx.x == 0) {
     for (int i = 0; i < QSIZE; ++i) {
-      init_barrier(&full[i], 0, 1);
-      init_barrier(&empty[i], 0, num_consumers * CLUSTERS);
+      PTXBarrier::init_barrier(&full[i], 0, 1);
+      PTXBarrier::init_barrier(&empty[i], 0, num_consumers * CLUSTERS);
     }
   }
   asm volatile("barrier.cluster.arrive;\n" : :);
@@ -243,7 +228,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           }
           wait(&empty[qidx], p);
 
-          expect_bytes(&full[qidx], (BK * BN + BK * BM) * sizeof(bf16));
+          PTXBarrier::expect_bytes_tx(&full[qidx],
+                                      (BK * BN + BK * BM) * sizeof(bf16));
           if constexpr (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {

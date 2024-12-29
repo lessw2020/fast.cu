@@ -7,6 +7,31 @@
 namespace wgmma_utils {
 
 // TMA Operations
+template <int BlockMajorSize, int BlockMinorSize>
+__host__ static inline CUtensorMap
+create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
+  CUtensorMap tma_map;
+  void *gmem_address = (void *)gmem_ptr;
+  static_assert(BlockMinorSize >= 64);
+  assert(global_width % 64 == 0);
+  uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height,
+                                 (uint64_t)global_width / 64, 1, 1};
+  uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width,
+                                  64 * sizeof(bf16), 0, 0, 0};
+  uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize),
+                                uint32_t(BlockMinorSize / 64), 1, 1};
+  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+  CUresult result = cuTensorMapEncodeTiled(
+      &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
+      gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+  assert(result == CUDA_SUCCESS);
+  return tma_map;
+}
+
 class TMAOps {
 public:
   __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
@@ -39,6 +64,72 @@ public:
                  "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
                  "r"(global_col_idx / 64), "h"(cluster_mask)
                  : "memory");
+  }
+};
+
+// Enhanced PTX-based barrier system
+class PTXBarrier {
+public:
+  __device__ static void init_barrier(uint64_t *bar, int thread_count,
+                                      int transaction_count) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
+                 "r"(thread_count + transaction_count));
+  }
+
+  __device__ static void expect_bytes_tx(uint64_t *bar, uint32_t bytes) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            bar_ptr),
+        "r"(bytes));
+  }
+
+  __device__ static void wait(uint64_t *bar, int phase_bit) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n"
+                 ".reg .pred P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+                 "@P1 bra.uni DONE;\n"
+                 "bra.uni LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(bar_ptr),
+                 "r"(phase_bit));
+  }
+
+  __device__ static void arrive(uint64_t *bar, uint32_t count = 1) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            bar_ptr),
+        "r"(count)
+        : "memory");
+  }
+
+  __device__ static void wait_cluster(uint64_t *bar, int phase_bit) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n"
+                 ".reg .pred P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, "
+                 "[%0], %1;\n"
+                 "@P1 bra.uni DONE;\n"
+                 "bra.uni LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(bar_ptr),
+                 "r"(phase_bit));
+  }
+
+  __device__ static void arrive_cluster(uint64_t *bar, uint32_t cta_id,
+                                        uint32_t count = 1) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n\t"
+                 ".reg .b32 remAddr32;\n\t"
+                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                 "mbarrier.arrive.shared::cluster.b64 _, [remAddr32], %2;\n\t"
+                 "}" ::"r"(smem_addr),
+                 "r"(cta_id), "r"(count));
   }
 };
 
