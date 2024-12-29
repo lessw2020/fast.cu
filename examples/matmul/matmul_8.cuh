@@ -91,23 +91,6 @@ __device__ static __forceinline__ void expect_bytes(uint64_t *bar,
       "r"(bytes));
 }
 
-__device__ static inline void load_async(bf16 *dst,
-                                         void const *const src_tma_map,
-                                         uint64_t *bar, int global_col_idx,
-                                         int global_row_idx) {
-  uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-  asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
-               "complete_tx::bytes"
-               " [%0], [%1, {%3, %4, %5}], [%2];"
-               :
-               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0),
-                 "r"(global_row_idx), "r"(global_col_idx / 64)
-               : "memory");
-}
-
 __device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
   uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
   asm volatile("{\n"
@@ -143,24 +126,6 @@ __device__ static __forceinline__ void wait_cluster(uint64_t *bar,
       "DONE:\n"
       "}\n" ::"r"(mbar_ptr),
       "r"(kPhaseBit));
-}
-
-__device__ static inline void
-load_async_multicast(bf16 *dst, void const *const src_tma_map, uint64_t *bar,
-                     int global_col_idx, int global_row_idx,
-                     uint16_t cluster_mask) {
-  uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-  asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
-               "complete_tx::bytes.multicast::cluster"
-               " [%0], [%1, {%3, %4, %5}], [%2], %6;"
-               :
-               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0),
-                 "r"(global_row_idx), "r"(global_col_idx / 64),
-                 "h"(cluster_mask)
-               : "memory");
 }
 
 __device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
@@ -282,24 +247,24 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           if constexpr (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {
-              load_async_multicast(&sA[qidx * BK * BM], &tensorMapA,
-                                   &full[qidx], block_k_iter * BK,
-                                   num_block_m * BM, mask);
+              TMAOps::load_async_multicast(&sA[qidx * BK * BM], &tensorMapA,
+                                           &full[qidx], block_k_iter * BK,
+                                           num_block_m * BM, mask);
             }
           } else {
-            load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
-                       block_k_iter * BK, num_block_m * BM);
+            TMAOps::load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
+                               block_k_iter * BK, num_block_m * BM);
           }
 
           if constexpr (CLUSTER_M > 1) {
             if (rank_m == 0) {
-              load_async_multicast(&sB[qidx * BK * BN], &tensorMapB,
-                                   &full[qidx], block_k_iter * BK,
-                                   num_block_n * BN, col_mask << rank_n);
+              TMAOps::load_async_multicast(
+                  &sB[qidx * BK * BN], &tensorMapB, &full[qidx],
+                  block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
             }
           } else {
-            load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
-                       block_k_iter * BK, num_block_n * BN);
+            TMAOps::load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
+                               block_k_iter * BK, num_block_n * BN);
           }
         }
       }

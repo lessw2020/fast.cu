@@ -6,6 +6,42 @@
 
 namespace wgmma_utils {
 
+// TMA Operations
+class TMAOps {
+public:
+  __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
+                                    uint64_t *bar, int global_col_idx,
+                                    int global_row_idx) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
+                 ":complete_tx::bytes"
+                 " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(dst_ptr),
+                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
+                 "r"(global_col_idx / 64)
+                 : "memory");
+  }
+
+  __device__ static void load_async_multicast(bf16 *dst,
+                                              void const *const src_tma_map,
+                                              uint64_t *bar, int global_col_idx,
+                                              int global_row_idx,
+                                              uint16_t cluster_mask) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
+                 ":complete_tx::bytes.multicast::cluster"
+                 " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(dst_ptr),
+                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
+                 "r"(global_col_idx / 64), "h"(cluster_mask)
+                 : "memory");
+  }
+};
+
 // WGMMA Descriptor for shared memory
 class WGMMADescriptor {
 private:
