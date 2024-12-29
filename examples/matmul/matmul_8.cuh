@@ -3,48 +3,11 @@ namespace M8 {
 
 using namespace wgmma_utils;
 
-__device__ void warpgroup_arrive() {
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-}
-
-__device__ void warpgroup_commit_batch() {
-  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-}
-
-template <int N> __device__ void warpgroup_wait() {
-  static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-}
-
-template <int BlockMajorSize, int BlockMinorSize>
-__host__ static inline CUtensorMap
-create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
-  CUtensorMap tma_map;
-  void *gmem_address = (void *)gmem_ptr;
-  static_assert(BlockMinorSize >= 64);
-  assert(global_width % 64 == 0);
-  uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height,
-                                 (uint64_t)global_width / 64, 1, 1};
-  uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width,
-                                  64 * sizeof(bf16), 0, 0, 0};
-  uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize),
-                                uint32_t(BlockMinorSize / 64), 1, 1};
-  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
-
-  CUresult result = cuTensorMapEncodeTiled(
-      &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
-      gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-  assert(result == CUDA_SUCCESS);
-  return tma_map;
-}
-
 CUtensorMap d_tma_map_A;
 CUtensorMap d_tma_map_B;
 int _prev_m = 0, _prev_n = 0, _prev_k = 0;
 
+// wgmma dispatch
 template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
           int TransB>
 __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
@@ -67,63 +30,6 @@ template <int BM, int BN, int BK, int QSIZE> struct SMem {
   alignas(128) bf16 A[BM * BK * QSIZE];
   alignas(128) bf16 B[BK * BN * QSIZE];
 };
-
-template <uint32_t RegCount> __device__ void warpgroup_reg_alloc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-template <uint32_t RegCount> __device__ void warpgroup_reg_dealloc() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-__device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("{\n"
-               ".reg .pred                P1;\n"
-               "LAB_WAIT:\n"
-               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-               "@P1                       bra.uni DONE;\n"
-               "bra.uni                   LAB_WAIT;\n"
-               "DONE:\n"
-               "}\n" ::"r"(mbar_ptr),
-               "r"(kPhaseBit));
-}
-
-__device__ static __forceinline__ void arrive(uint64_t *bar,
-                                              uint32_t count = 1) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
-               :
-               : "r"(mbar_ptr), "r"(count)
-               : "memory");
-}
-
-__device__ static __forceinline__ void wait_cluster(uint64_t *bar,
-                                                    int kPhaseBit) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile(
-      "{\n"
-      ".reg .pred                P1;\n"
-      "LAB_WAIT:\n"
-      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
-      "@P1                       bra.uni DONE;\n"
-      "bra.uni                   LAB_WAIT;\n"
-      "DONE:\n"
-      "}\n" ::"r"(mbar_ptr),
-      "r"(kPhaseBit));
-}
-
-__device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
-                               uint32_t count = 1) {
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("{\n\t"
-               ".reg .b32 remAddr32;\n\t"
-               "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-               "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
-               "}"
-               :
-               : "r"(smem_addr), "r"(cta_id), "r"(count));
-}
 
 template <int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
@@ -207,7 +113,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   // Producer
   if (wg_idx == 0) {
     constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-    warpgroup_reg_dealloc<num_regs>();
+    RegisterManager::warpgroup_reg_dealloc<num_regs>();
     if (tid == 0) {
       int p = 0;
       int qidx = 0;
@@ -226,7 +132,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             qidx = 0;
             p ^= 1;
           }
-          wait(&empty[qidx], p);
+          PTXBarrier::wait(&empty[qidx], p);
 
           PTXBarrier::expect_bytes_tx(&full[qidx],
                                       (BK * BN + BK * BM) * sizeof(bf16));
@@ -258,12 +164,12 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   } else {
     constexpr int num_regs =
         (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-    warpgroup_reg_alloc<num_regs>();
+    RegisterManager::warpgroup_reg_alloc<num_regs>();
     float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
     --wg_idx;
     for (int qidx = 0; qidx < QSIZE; ++qidx) {
       if (tid < CLUSTERS)
-        arrive_cluster(&empty[qidx], tid);
+        PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
     int p = 0;
     int qidx = 0;
@@ -279,8 +185,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           qidx = 0;
           p ^= 1;
         };
-        wait(&full[qidx], p);
-        warpgroup_arrive();
+        PTXBarrier::wait(&full[qidx], p);
+        WGMMASyncOps::warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
@@ -297,10 +203,10 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
         }
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
+        WGMMASyncOps::warpgroup_commit_batch();
+        WGMMASyncOps::warpgroup_wait<0>();
         if (tid < CLUSTERS)
-          arrive_cluster(&empty[qidx], tid);
+          PTXBarrier::arrive_cluster(&empty[qidx], tid);
       }
 
       bf16 *block_C = C + num_block_n * BN * M + num_block_m * BM;

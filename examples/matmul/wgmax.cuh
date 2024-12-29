@@ -193,6 +193,34 @@ public:
   }
 };
 
+// Register Management
+class RegisterManager {
+public:
+  template <uint32_t RegCount> __device__ static void warpgroup_reg_alloc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+  }
+
+  template <uint32_t RegCount> __device__ static void warpgroup_reg_dealloc() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+  }
+};
+
+// WGMMA synchronization operations
+struct WGMMASyncOps {
+  __device__ static void warpgroup_arrive() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  }
+
+  __device__ static void warpgroup_commit_batch() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+  }
+
+  template <int N> __device__ static void warpgroup_wait() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+  }
+};
+
 // =========== WGMMA (Tensor Core) ASM routines ================
 
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
