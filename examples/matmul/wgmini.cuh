@@ -1,33 +1,90 @@
+
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
+
 namespace wgmma_utils {
 
-// Configuration validation
-template <typename Config> struct ValidateWGMMAConfig {
-  static_assert(Config::ScaleD >= 0 && Config::ScaleD <= 4,
-                "ScaleD must be in range [0,4]");
-  static_assert(Config::ScaleA >= 0 && Config::ScaleA <= 4,
-                "ScaleA must be in range [0,4]");
-  static_assert(Config::ScaleB >= 0 && Config::ScaleB <= 4,
-                "ScaleB must be in range [0,4]");
-  static_assert(Config::TransformA == 0 || Config::TransformA == 1,
-                "TransformA must be 0 or 1");
-  static_assert(Config::TransformB == 0 || Config::TransformB == 1,
-                "TransformB must be 0 or 1");
-  static constexpr bool IsValid = true;
+// Base kernel configuration
+template <typename T, int BM, int BN, int BK> struct KernelConfig {
+  using DataType = T;
+  static constexpr int BlockM = BM;
+  static constexpr int BlockN = BN;
+  static constexpr int BlockK = BK;
+
+  static_assert(BM > 0 && BM % 64 == 0,
+                "BM must be positive and aligned to 64");
+  static_assert(BN > 0 && BN % 16 == 0,
+                "BN must be positive and aligned to 16");
+  static_assert(BK > 0 && BK % 16 == 0,
+                "BK must be positive and aligned to 16");
+  static_assert(std::is_same_v<T, bf16>, "Only bf16 data type is supported");
 };
 
-struct DefaultConfig {
-  static constexpr int ScaleD = 1;
-  static constexpr int ScaleA = 1;
-  static constexpr int ScaleB = 1;
-  static constexpr int TransformA = 0;
-  static constexpr int TransformB = 0;
+// TMA Descriptor for global memory
+class TMADescriptor {
+public:
+  template <typename Config>
+  static CUtensorMap createDesc(typename Config::DataType *gmem_ptr,
+                                int global_height, int global_width,
+                                int block_height, int block_width) {
+    CUtensorMap desc;
+    static_assert(block_width >= 64);
+    assert(global_width % 64 == 0);
+
+    uint64_t gmem_shape[5] = {64, (uint64_t)global_height,
+                              (uint64_t)global_width / 64, 1, 1};
+    uint64_t gmem_stride[5] = {sizeof(typename Config::DataType) * global_width,
+                               64 * sizeof(typename Config::DataType), 0, 0, 0};
+    uint32_t smem_shape[5] = {64, uint32_t(block_height),
+                              uint32_t(block_width / 64), 1, 1};
+    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_ptr, gmem_shape,
+        gmem_stride, smem_shape, smem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return desc;
+  }
 };
 
-// Enhanced PTX-based barrier system
+// TMA Descriptor Cache
+template <typename Config> class TMACache {
+private:
+  static CUtensorMap tmaMapA;
+  static CUtensorMap tmaMapB;
+  static int prevM, prevN, prevK;
+
+public:
+  static void initializeMaps(int M, int N, int K, bf16 *A, bf16 *B) {
+    if (M != prevM || N != prevN || K != prevK) {
+      tmaMapA = TMADescriptor::createDesc<Config>(A, M, K, Config::BlockM,
+                                                  Config::BlockK);
+      tmaMapB = TMADescriptor::createDesc<Config>(B, N, K, Config::BlockN,
+                                                  Config::BlockK);
+      prevM = M;
+      prevN = N;
+      prevK = K;
+    }
+    assert(M == prevM && N == prevN && K == prevK);
+  }
+
+  static const CUtensorMap &getMapA() { return tmaMapA; }
+  static const CUtensorMap &getMapB() { return tmaMapB; }
+};
+
+template <typename Config> CUtensorMap TMACache<Config>::tmaMapA;
+template <typename Config> CUtensorMap TMACache<Config>::tmaMapB;
+template <typename Config> int TMACache<Config>::prevM = 0;
+template <typename Config> int TMACache<Config>::prevN = 0;
+template <typename Config> int TMACache<Config>::prevK = 0;
+
+// PTX Barrier System
 class PTXBarrier {
 public:
   __device__ static void init_barrier(uint64_t *bar, int thread_count,
@@ -93,64 +150,71 @@ public:
   }
 };
 
-// WGMMA descriptor handling
+// WGMMA synchronization operations
+struct WGMMASyncOps {
+  __device__ static void arrive() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  }
+
+  __device__ static void commit_group() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+  }
+
+  template <int N> __device__ static void wait_group() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+  }
+};
+
+// Register Management
+class RegisterManager {
+public:
+  template <uint32_t RegCount> __device__ static void alloc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+  }
+
+  template <uint32_t RegCount> __device__ static void dealloc() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+  }
+};
+
+// Shared Memory Layout
+template <typename Config> struct SharedMemoryLayout {
+  struct Buffer {
+    alignas(128) typename Config::DataType A[Config::BlockM * Config::BlockK];
+    alignas(128) typename Config::DataType B[Config::BlockK * Config::BlockN];
+  };
+
+  template <int QueueSize> struct QueuedBuffer {
+    alignas(128) typename Config::DataType
+        A[Config::BlockM * Config::BlockK * QueueSize];
+    alignas(128) typename Config::DataType
+        B[Config::BlockK * Config::BlockN * QueueSize];
+  };
+};
+
+// WGMMA Descriptor for shared memory
 class WGMMADescriptor {
 private:
   static constexpr uint64_t SWIZZLE_BITS_128 = 1llu << 62;
   static constexpr uint32_t MATRIX_ENCODE_MASK = 0x3FFFF;
   static constexpr uint32_t MATRIX_ENCODE_SHIFT = 0x4;
 
-protected:
-  __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
-    return ((x & MATRIX_ENCODE_MASK) >> MATRIX_ENCODE_SHIFT);
-  }
-
 public:
-  __device__ static uint64_t make_smem_desc(bf16 *ptr) {
+  __device__ static uint64_t makeSharedDesc(bf16 *ptr) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    uint64_t desc = 0x0000000000000000;
-    desc |= matrix_descriptor_encode(addr);
-    desc |= matrix_descriptor_encode((uint64_t)16) << 16;
-    desc |= matrix_descriptor_encode((uint64_t)1024) << 32;
+    uint64_t desc = 0;
+    desc |= ((addr & MATRIX_ENCODE_MASK) >> MATRIX_ENCODE_SHIFT);
+    desc |= ((uint64_t)16 & MATRIX_ENCODE_MASK) << 16;
+    desc |= ((uint64_t)1024 & MATRIX_ENCODE_MASK) << 32;
     desc |= SWIZZLE_BITS_128;
     return desc;
   }
 };
 
-// WGMMA synchronization operations
-struct WGMMASyncOps {
-  __device__ static inline void arrive() {
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-  }
-
-  __device__ static inline void commit_group() {
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-  }
-
-  template <int N> __device__ static inline void wait_group() {
-    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-  }
-};
-
-// Shared memory layout template
-template <typename T, int BM, int BN, int BK, int QSIZE>
-struct SharedMemoryLayout {
-  static_assert(BM > 0 && BM % 64 == 0,
-                "BM must be positive and aligned to 64");
-  static_assert(BN > 0 && BN % 16 == 0,
-                "BN must be positive and aligned to 16");
-  static_assert(BK > 0 && BK % 16 == 0,
-                "BK must be positive and aligned to 16");
-  static_assert(QSIZE > 0 && QSIZE <= 8, "QSIZE must be between 1 and 8");
-  static_assert(std::is_same_v<T, bf16>, "Only bf16 data type is supported");
-
-  alignas(128) T A[BM * BK * QSIZE];
-  alignas(128) T B[BK * BN * QSIZE];
-};
-
-// Enhanced TMA operations
-struct TMAOps {
+// TMA Operations
+class TMAOps {
+public:
   __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
                                     uint64_t *bar, int global_col_idx,
                                     int global_row_idx) {
@@ -184,21 +248,74 @@ struct TMAOps {
   }
 };
 
-// Register allocation management
-struct RegisterManager {
-  template <uint32_t RegCount> __device__ static void alloc() {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+// Schedule template
+template <int Version, int NumSM, int BM, int BN, int TM, int TN>
+struct Schedule {
+  int block;
+  int it;
+  int total_blocks_m, total_blocks_n;
+
+  __device__ __forceinline__ Schedule(int M, int N, int _block) {
+    block = _block;
+    it = 0;
+    total_blocks_m = CEIL_DIV(M, BM);
+    total_blocks_n = CEIL_DIV(N, BN);
+    assert(total_blocks_m % TM == 0 && total_blocks_n % TN == 0);
   }
 
-  template <uint32_t RegCount> __device__ static void dealloc() {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+  __device__ __forceinline__ bool next(int &block_m, int &block_n) {
+    int num = it * NumSM + block;
+    if (num >= total_blocks_m * total_blocks_n) {
+      return false;
+    }
+
+    int cur_tile = num / (TM * TN);
+    int cur_tile_pos = num % (TM * TN);
+    block_m = TM * (cur_tile / (total_blocks_n / TN));
+    block_n = TN * (cur_tile % (total_blocks_n / TN));
+    block_m += cur_tile_pos / TN;
+    block_n += cur_tile_pos % TN;
+    ++it;
+    return true;
   }
 };
 
-template <typename Config = DefaultConfig>
+// Cluster Management
+struct ClusterInfo {
+  uint32_t cluster_id;
+  uint32_t cluster_m;
+  uint32_t cluster_n;
+  uint32_t cta_rank;
+  uint32_t rank_m;
+  uint32_t rank_n;
+
+  __device__ static ClusterInfo get() {
+    ClusterInfo info;
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(info.cta_rank));
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(info.cluster_id));
+
+    // Derive cluster dimensions from compilation constants
+    info.cluster_m = blockDim.y; // Assuming blockDim.y is cluster_m
+    info.cluster_n = blockDim.z; // Assuming blockDim.z is cluster_n
+
+    // Calculate rank position within cluster
+    info.rank_m = info.cta_rank / info.cluster_n;
+    info.rank_n = info.cta_rank % info.cluster_n;
+
+    return info;
+  }
+
+  __device__ static void syncCluster() {
+    asm volatile("barrier.cluster.arrive;\n" : :);
+    asm volatile("barrier.cluster.wait;\n" : :);
+  }
+};
+
+// WGMMA Operations
+template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
-  uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
-  uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
+  uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
+  uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
   asm volatile("{\n"
                "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
                "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -257,16 +374,12 @@ __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
                  "n"(int32_t(Config::TransformA)),
                  "n"(int32_t(Config::TransformB)));
-
-  //: "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
-  //  "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
-  //  "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
-template <typename Config = DefaultConfig>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
 __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
-  uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
-  uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
+  uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
+  uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
   asm volatile("{\n"
                "wgmma.mma_async.sync.aligned.m64n192k16.f32.bf16.bf16 "
                "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -315,10 +428,10 @@ __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::TransformB)));
 }
 
-template <typename Config = DefaultConfig>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
 __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
-  uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
-  uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
+  uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
+  uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
   asm volatile("{\n"
                "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
                "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -355,10 +468,10 @@ __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::TransformB)));
 }
 
-template <typename Config = DefaultConfig>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
 __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
-  uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
-  uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
+  uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
+  uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
   asm volatile("{\n"
                "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
                "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -383,10 +496,10 @@ __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::TransformB)));
 }
 
-template <typename Config = DefaultConfig>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
 __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
-  uint64_t desc_a = WGMMADescriptor::make_smem_desc(&sA[0]);
-  uint64_t desc_b = WGMMADescriptor::make_smem_desc(&sB[0]);
+  uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
+  uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
   asm volatile("{\n"
                "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
                "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -403,6 +516,36 @@ __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
                  "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
                  "n"(int32_t(Config::TransformA)),
                  "n"(int32_t(Config::TransformB)));
+}
+
+// Generic WGMMA dispatch
+template <int Size, int ScaleD = 1, int ScaleA = 1, int ScaleB = 1,
+          bool TransA = false, bool TransB = false>
+__device__ __forceinline__ void wgmma_dispatch(void *d, bf16 *sA, bf16 *sB) {
+  static_assert(ScaleD >= 0 && ScaleD <= 4, "ScaleD must be in range [0,4]");
+  static_assert(ScaleA >= 0 && ScaleA <= 4, "ScaleA must be in range [0,4]");
+  static_assert(ScaleB >= 0 && ScaleB <= 4, "ScaleB must be in range [0,4]");
+
+  if constexpr (Size == 256) {
+    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+        reinterpret_cast<float(*)[16][8]>(d), sA, sB);
+  } else if constexpr (Size == 192) {
+    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+        reinterpret_cast<float(*)[12][8]>(d), sA, sB);
+  } else if constexpr (Size == 128) {
+    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+        reinterpret_cast<float(*)[8][8]>(d), sA, sB);
+  } else if constexpr (Size == 64) {
+    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+        reinterpret_cast<float(*)[4][8]>(d), sA, sB);
+  } else if constexpr (Size == 32) {
+    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+        reinterpret_cast<float(*)[2][8]>(d), sA, sB);
+  } else {
+    static_assert(
+        Size == 256 || Size == 192 || Size == 128 || Size == 64 || Size == 32,
+        "Invalid WGMMA size. Must be one of: 256, 192, 128, 64, or 32");
+  }
 }
 
 } // namespace wgmma_utils
