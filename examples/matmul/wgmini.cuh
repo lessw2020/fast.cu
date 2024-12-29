@@ -31,7 +31,8 @@ public:
                                 int global_height, int global_width,
                                 int block_height, int block_width) {
     CUtensorMap desc;
-    static_assert(block_width >= 64);
+    // Move from static_assert to runtime assert
+    assert(block_width >= 64);
     assert(global_width % 64 == 0);
 
     uint64_t gmem_shape[5] = {64, (uint64_t)global_height,
@@ -52,7 +53,6 @@ public:
     return desc;
   }
 };
-
 // TMA Descriptor Cache
 template <typename Config> class TMACache {
 private:
@@ -312,7 +312,7 @@ struct ClusterInfo {
 };
 
 // WGMMA Operations
-template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransformA, bool TransformB>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
   uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
@@ -370,13 +370,12 @@ __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
                  "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]),
                  "+f"(d[15][4]), "+f"(d[15][5]), "+f"(d[15][6]), "+f"(d[15][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
-                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
-                 "n"(int32_t(Config::TransformA)),
-                 "n"(int32_t(Config::TransformB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+                 "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransformA, bool TransformB>
 __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
   uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
@@ -422,13 +421,12 @@ __device__ __forceinline__ void wgmma192(float d[12][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[10][4]), "+f"(d[10][5]), "+f"(d[10][6]), "+f"(d[10][7]),
                  "+f"(d[11][0]), "+f"(d[11][1]), "+f"(d[11][2]), "+f"(d[11][3]),
                  "+f"(d[11][4]), "+f"(d[11][5]), "+f"(d[11][6]), "+f"(d[11][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
-                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
-                 "n"(int32_t(Config::TransformA)),
-                 "n"(int32_t(Config::TransformB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+                 "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransformA, bool TransformB>
 __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
   uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
@@ -462,13 +460,12 @@ __device__ __forceinline__ void wgmma128(float d[8][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[6][4]), "+f"(d[6][5]), "+f"(d[6][6]), "+f"(d[6][7]),
                  "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
                  "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
-                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
-                 "n"(int32_t(Config::TransformA)),
-                 "n"(int32_t(Config::TransformB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+                 "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransformA, bool TransformB>
 __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
   uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
@@ -490,13 +487,12 @@ __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
                  "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]),
                  "+f"(d[3][4]), "+f"(d[3][5]), "+f"(d[3][6]), "+f"(d[3][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
-                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
-                 "n"(int32_t(Config::TransformA)),
-                 "n"(int32_t(Config::TransformB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+                 "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
-template <int ScaleD, int ScaleA, int ScaleB, bool TransA, bool TransB>
+template <int ScaleD, int ScaleA, int ScaleB, bool TransformA, bool TransformB>
 __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
   uint64_t desc_a = WGMMADescriptor::makeSharedDesc(sA);
   uint64_t desc_b = WGMMADescriptor::makeSharedDesc(sB);
@@ -512,34 +508,33 @@ __device__ void wgmma32(float d[2][8], bf16 *sA, bf16 *sB) {
                  "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7]),
                  "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
                  "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7])
-               : "l"(desc_a), "l"(desc_b), "n"(int32_t(Config::ScaleD)),
-                 "n"(int32_t(Config::ScaleA)), "n"(int32_t(Config::ScaleB)),
-                 "n"(int32_t(Config::TransformA)),
-                 "n"(int32_t(Config::TransformB)));
+               : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)),
+                 "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)),
+                 "n"(int32_t(TransformA)), "n"(int32_t(TransformB)));
 }
 
 // Generic WGMMA dispatch
 template <int Size, int ScaleD = 1, int ScaleA = 1, int ScaleB = 1,
-          bool TransA = false, bool TransB = false>
+          bool TransformA = false, bool TransformB = false>
 __device__ __forceinline__ void wgmma_dispatch(void *d, bf16 *sA, bf16 *sB) {
   static_assert(ScaleD >= 0 && ScaleD <= 4, "ScaleD must be in range [0,4]");
   static_assert(ScaleA >= 0 && ScaleA <= 4, "ScaleA must be in range [0,4]");
   static_assert(ScaleB >= 0 && ScaleB <= 4, "ScaleB must be in range [0,4]");
 
   if constexpr (Size == 256) {
-    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+    wgmma256<ScaleD, ScaleA, ScaleB, TransformA, TransformB>(
         reinterpret_cast<float(*)[16][8]>(d), sA, sB);
   } else if constexpr (Size == 192) {
-    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+    wgmma192<ScaleD, ScaleA, ScaleB, TransformA, TransformB>(
         reinterpret_cast<float(*)[12][8]>(d), sA, sB);
   } else if constexpr (Size == 128) {
-    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+    wgmma128<ScaleD, ScaleA, ScaleB, TransformA, TransformB>(
         reinterpret_cast<float(*)[8][8]>(d), sA, sB);
   } else if constexpr (Size == 64) {
-    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+    wgmma64<ScaleD, ScaleA, ScaleB, TransformA, TransformB>(
         reinterpret_cast<float(*)[4][8]>(d), sA, sB);
   } else if constexpr (Size == 32) {
-    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(
+    wgmma32<ScaleD, ScaleA, ScaleB, TransformA, TransformB>(
         reinterpret_cast<float(*)[2][8]>(d), sA, sB);
   } else {
     static_assert(

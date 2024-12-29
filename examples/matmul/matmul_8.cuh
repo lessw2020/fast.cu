@@ -177,7 +177,7 @@ __global__ __launch_bounds__(Config::NumThreads)
 
           for (int bk = 0; bk < Config::BlockK; bk += 64) {
             for (int k_it = 0; k_it < 64 / Config::WarpgroupK; ++k_it) {
-              wgmma_dispatch<Config::BlockN>(
+              wgmma_dispatch<Config::BlockN, 1, 1, 1, false, false>(
                   &d[m_it][0][0], &wgmma_sA[k_it * Config::WarpgroupK],
                   &wgmma_sB[k_it * Config::WarpgroupK]);
             }
@@ -230,7 +230,7 @@ __global__ __launch_bounds__(Config::NumThreads)
 
 // Host-side launch function
 template <typename Config = Matmul8Config<>>
-void runMatmul8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void runKernel8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   // Initialize TMA descriptors
   TMACache<Config>::initializeMaps(M, N, K, A, B);
 
@@ -249,4 +249,4 @@ void runMatmul8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 
 } // namespace M8
 
-using M8::runMatmul8;
+using M8::runKernel8;
