@@ -2,19 +2,6 @@
 namespace M10 {
 using namespace wgmma_utils;
 
-__device__ void warpgroup_arrive() {
-  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-}
-
-__device__ void warpgroup_commit_batch() {
-  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-}
-
-template <int N> __device__ void warpgroup_wait() {
-  static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-}
-
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle = true>
 __host__ static inline CUtensorMap
 create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
@@ -320,7 +307,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           p ^= 1;
         };
         wait(&full[qidx], p);
-        warpgroup_arrive();
+        WGMMASyncOps::warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
@@ -347,8 +334,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
         }
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
+        WGMMASyncOps::warpgroup_commit_batch();
+        WGMMASyncOps::warpgroup_wait<0>();
         if (tid < CLUSTERS)
           arrive_cluster(&empty[qidx], tid);
         ++qidx;
@@ -360,7 +347,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           p ^= 1;
         };
         wait(&full[qidx], p);
-        warpgroup_arrive();
+        WGMMASyncOps::warpgroup_arrive();
 #pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
@@ -377,8 +364,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
         }
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
+        WGMMASyncOps::warpgroup_commit_batch();
+        WGMMASyncOps::warpgroup_wait<0>();
         if (tid < CLUSTERS)
           arrive_cluster(&empty[qidx], tid);
       }
