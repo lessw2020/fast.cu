@@ -252,8 +252,8 @@ void runKernel8(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
 
   if (_prev_m != M) {
-    d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
-    d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
+    d_tma_map_A = TensorMapManager::create_tensor_map<BM, BK>(A, M, K);
+    d_tma_map_B = TensorMapManager::create_tensor_map<BN, BK>(B, N, K);
     _prev_m = M;
     _prev_n = N;
     _prev_k = K;

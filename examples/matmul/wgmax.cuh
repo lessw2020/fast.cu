@@ -15,30 +15,36 @@ template <int BM, int BN, int BK, int QSIZE> struct SharedMemoryLayout {
 };
 
 // TMA Operations
-template <int BlockMajorSize, int BlockMinorSize>
-__host__ static inline CUtensorMap
-create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
-  CUtensorMap tma_map;
-  void *gmem_address = (void *)gmem_ptr;
-  static_assert(BlockMinorSize >= 64);
-  assert(global_width % 64 == 0);
-  uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height,
-                                 (uint64_t)global_width / 64, 1, 1};
-  uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width,
-                                  64 * sizeof(bf16), 0, 0, 0};
-  uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize),
-                                uint32_t(BlockMinorSize / 64), 1, 1};
-  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+// Tensor map creation and management
+class TensorMapManager {
+public:
+  template <int BlockMajorSize, int BlockMinorSize, bool swizzle = true>
+  __host__ static inline CUtensorMap
+  create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
+    CUtensorMap tma_map;
+    void *gmem_address = (void *)gmem_ptr;
+    static_assert(BlockMinorSize >= 64);
+    assert(global_width % 64 == 0);
 
-  CUresult result = cuTensorMapEncodeTiled(
-      &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
-      gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height,
+                                   (uint64_t)global_width / 64, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width,
+                                    64 * sizeof(bf16), 0, 0, 0};
+    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize),
+                                  uint32_t(BlockMinorSize / 64), 1, 1};
+    uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
-  assert(result == CUDA_SUCCESS);
-  return tma_map;
-}
+    CUresult result = cuTensorMapEncodeTiled(
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
+        gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return tma_map;
+  }
+};
 
 class TMAOps {
 public:

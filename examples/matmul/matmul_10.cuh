@@ -2,37 +2,12 @@
 namespace M10 {
 using namespace wgmma_utils;
 
-template <int BlockMajorSize, int BlockMinorSize, bool swizzle = true>
-__host__ static inline CUtensorMap
-create_tensor_map(bf16 *gmem_ptr, int global_height, int global_width) {
-  CUtensorMap tma_map;
-  void *gmem_address = (void *)gmem_ptr;
-  static_assert(BlockMinorSize >= 64);
-  assert(global_width % 64 == 0);
-  uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height,
-                                 (uint64_t)global_width / 64, 1, 1};
-  uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width,
-                                  64 * sizeof(bf16), 0, 0, 0};
-  uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize),
-                                uint32_t(BlockMinorSize / 64), 1, 1};
-  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
-
-  CUresult result = cuTensorMapEncodeTiled(
-      &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
-      gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-  assert(result == CUDA_SUCCESS);
-  return tma_map;
-}
-
 CUtensorMap d_tma_map_A;
 CUtensorMap d_tma_map_B;
 CUtensorMap d_tma_map_C;
 int _prev_m = 0, _prev_n = 0, _prev_k = 0;
 
+// WGMMA dispatcher
 template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
           int TransB>
 __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
@@ -397,9 +372,9 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
   static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
 
   if (_prev_m != M) {
-    d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
-    d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-    d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
+    d_tma_map_A = TensorMapManager::create_tensor_map<BM, BK>(A, M, K);
+    d_tma_map_B = TensorMapManager::create_tensor_map<BN, BK>(B, N, K);
+    d_tma_map_C = TensorMapManager::create_tensor_map<BN, BM, false>(C, N, M);
     _prev_m = M;
     _prev_n = N;
     _prev_k = K;
