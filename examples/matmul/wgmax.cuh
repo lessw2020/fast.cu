@@ -46,6 +46,49 @@ public:
   }
 };
 
+// Cluster utility functions
+// Do we need the memory clobber????
+class ClusterOps {
+public:
+  // Get the current cluster ID
+  __device__ static uint32_t get_cluster_id() {
+    uint32_t cluster_id;
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(cluster_id));
+    return cluster_id;
+  }
+
+  // Get the current cluster rank within cluster
+  __device__ static uint32_t get_cluster_rank() {
+    uint32_t rank;
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank));
+    return rank;
+  }
+
+  // Get cluster dimensions
+  __device__ static void get_cluster_dims(uint32_t &dim_x, uint32_t &dim_y,
+                                          uint32_t &dim_z) {
+    asm volatile("mov.u32 %0, %cluster_dim.x;\n" : "=r"(dim_x));
+    asm volatile("mov.u32 %0, %cluster_dim.y;\n" : "=r"(dim_y));
+    asm volatile("mov.u32 %0, %cluster_dim.z;\n" : "=r"(dim_z));
+  }
+
+  // Synchronize all threads in the cluster
+  __device__ static void cluster_sync() {
+    asm volatile("barrier.cluster.arrive;\n" : : : "memory");
+    asm volatile("barrier.cluster.wait;\n" : : : "memory");
+  }
+
+  // Only arrive at the barrier
+  __device__ static void cluster_arrive() {
+    asm volatile("barrier.cluster.arrive;\n" : : : "memory");
+  }
+
+  // Only wait at the barrier
+  __device__ static void cluster_wait() {
+    asm volatile("barrier.cluster.wait;\n" : : : "memory");
+  }
+};
+
 class TMAOps {
 public:
   __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
