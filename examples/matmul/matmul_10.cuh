@@ -26,80 +26,6 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
     wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
-__device__ static __forceinline__ void expect_bytes(uint64_t *bar,
-                                                    uint32_t bytes) {
-  uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile(
-      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar_ptr),
-      "r"(bytes));
-}
-
-__device__ static inline void load_async(bf16 *dst, void const *src_tma_map,
-                                         uint64_t *bar, int global_col_idx,
-                                         int global_row_idx) {
-  uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-  asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
-               "complete_tx::bytes"
-               " [%0], [%1, {%3, %4, %5}], [%2];"
-               :
-               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0),
-                 "r"(global_row_idx), "r"(global_col_idx / 64)
-               : "memory");
-}
-
-/*__device__ static __forceinline__ void wait(uint64_t *bar, int kPhaseBit) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("{\n"
-               ".reg .pred                P1;\n"
-               "LAB_WAIT:\n"
-               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-               "@P1                       bra.uni DONE;\n"
-               "bra.uni                   LAB_WAIT;\n"
-               "DONE:\n"
-               "}\n" ::"r"(mbar_ptr),
-               "r"(kPhaseBit));
-}
-*/
-
-__device__ static __forceinline__ void arrive(uint64_t *bar,
-                                              uint32_t count = 1) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
-               :
-               : "r"(mbar_ptr), "r"(count)
-               : "memory");
-}
-
-__device__ static __forceinline__ void wait_cluster(uint64_t *bar,
-                                                    int kPhaseBit) {
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile(
-      "{\n"
-      ".reg .pred                P1;\n"
-      "LAB_WAIT:\n"
-      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
-      "@P1                       bra.uni DONE;\n"
-      "bra.uni                   LAB_WAIT;\n"
-      "DONE:\n"
-      "}\n" ::"r"(mbar_ptr),
-      "r"(kPhaseBit));
-}
-
-__device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
-                               uint32_t count = 1) {
-  uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  asm volatile("{\n\t"
-               ".reg .b32 remAddr32;\n\t"
-               "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-               "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
-               "}"
-               :
-               : "r"(smem_addr), "r"(cta_id), "r"(count));
-}
-
 template <int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule;
 
@@ -157,6 +83,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   uint32_t rank;
   asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
+  // Fails numerical verification:
+  // uint32_t rank = ClusterOps::get_cluster_rank();
 
   const int num_blocks_k = K / BK;
   int wg_idx = threadIdx.x / 128;
@@ -203,7 +131,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           }
           PTXBarrier::wait(&empty[qidx], p);
 
-          expect_bytes(&full[qidx], (BK * BN + BK * BM) * sizeof(bf16));
+          PTXBarrier::expect_bytes_tx(&full[qidx],
+                                      (BK * BN + BK * BM) * sizeof(bf16));
           if constexpr (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {
@@ -212,8 +141,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
                                            num_block_m * BM, mask);
             }
           } else {
-            load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
-                       block_k_iter * BK, num_block_m * BM);
+            TMAOps::load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
+                               block_k_iter * BK, num_block_m * BM);
           }
 
           if constexpr (CLUSTER_M > 1) {
@@ -223,8 +152,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
                   block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
             }
           } else {
-            load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
-                       block_k_iter * BK, num_block_n * BN);
+            TMAOps::load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
+                               block_k_iter * BK, num_block_n * BN);
           }
         }
       }
@@ -237,7 +166,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
     --wg_idx;
     for (int qidx = 0; qidx < QSIZE; ++qidx) {
       if (tid < CLUSTERS)
-        arrive_cluster(&empty[qidx], tid);
+        PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
     int p = 0;
     int qidx = 0;
@@ -281,7 +210,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
         WGMMASyncOps::warpgroup_commit_batch();
         WGMMASyncOps::warpgroup_wait<0>();
         if (tid < CLUSTERS)
-          arrive_cluster(&empty[qidx], tid);
+          PTXBarrier::arrive_cluster(&empty[qidx], tid);
         ++qidx;
       }
       for (int block_k_iter = 1; block_k_iter < num_blocks_k;
@@ -311,7 +240,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
         WGMMASyncOps::warpgroup_commit_batch();
         WGMMASyncOps::warpgroup_wait<0>();
         if (tid < CLUSTERS)
-          arrive_cluster(&empty[qidx], tid);
+          PTXBarrier::arrive_cluster(&empty[qidx], tid);
       }
 
       asm volatile("cp.async.bulk.wait_group 0;");
