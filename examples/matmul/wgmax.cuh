@@ -2,16 +2,188 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
+
+// ============================================================================
+// Helper Macros and Constants
+// ============================================================================
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
 namespace wgmma_utils {
 
-// Shared Memory layout for matrix operations
+// ============================================================================
+// Core Data Structures
+// ============================================================================
+
+/**
+ * @brief Shared Memory layout for matrix operations
+ * @tparam BM Block size M dimension
+ * @tparam BN Block size N dimension
+ * @tparam BK Block size K dimension
+ * @tparam QSIZE Queue size for synchronization
+ */
 template <int BM, int BN, int BK, int QSIZE> struct SharedMemoryLayout {
-  alignas(128) bf16 A[BM * BK * QSIZE];
-  alignas(128) bf16 B[BK * BN * QSIZE];
-  alignas(128) bf16 C[BN * BM];
-  alignas(8) uint64_t full[QSIZE], empty[QSIZE];
+  alignas(128) bf16 A[BM * BK * QSIZE]; // Matrix A data
+  alignas(128) bf16 B[BK * BN * QSIZE]; // Matrix B data
+  alignas(128) bf16 C[BN * BM];         // Output matrix C
+  alignas(8) uint64_t full[QSIZE];      // Full flags for sync
+  alignas(8) uint64_t empty[QSIZE];     // Empty flags for sync
+};
+
+// ============================================================================
+// Memory Management Classes
+// ============================================================================
+
+// WGMMA Descriptor for shared memory
+class WGMMADescriptor {
+private:
+  static constexpr uint64_t SWIZZLE_BITS_128 = 1llu << 62;
+  static constexpr uint32_t MATRIX_ENCODE_MASK = 0x3FFFF;
+  static constexpr uint32_t MATRIX_ENCODE_SHIFT = 0x4;
+
+protected:
+  __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
+    return ((x & MATRIX_ENCODE_MASK) >> MATRIX_ENCODE_SHIFT);
+  }
+
+public:
+  __device__ static uint64_t make_smem_desc(bf16 *ptr) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    uint64_t desc = 0x0000000000000000;
+
+    static constexpr uint64_t STRIDE = 16;
+    static constexpr uint64_t BLOCK_SIZE = 1024;
+
+    desc |= matrix_descriptor_encode(addr);
+    desc |= matrix_descriptor_encode(STRIDE) << 16;
+    desc |= matrix_descriptor_encode(BLOCK_SIZE) << 32;
+    desc |= SWIZZLE_BITS_128;
+
+    return desc;
+  }
+};
+
+// TMA Descriptor for global memory
+class TMADescriptor {
+public:
+  template <typename Config>
+  static CUtensorMap createDesc(typename Config::DataType *gmem_ptr,
+                                int global_height, int global_width,
+                                int block_height, int block_width) {
+    CUtensorMap desc;
+    // Move from static_assert to runtime assert
+    assert(block_width >= 64);
+    assert(global_width % 64 == 0);
+
+    uint64_t gmem_shape[5] = {64, (uint64_t)global_height,
+                              (uint64_t)global_width / 64, 1, 1};
+    uint64_t gmem_stride[5] = {sizeof(typename Config::DataType) * global_width,
+                               64 * sizeof(typename Config::DataType), 0, 0, 0};
+    uint32_t smem_shape[5] = {64, uint32_t(block_height),
+                              uint32_t(block_width / 64), 1, 1};
+    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_ptr, gmem_shape,
+        gmem_stride, smem_shape, smem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return desc;
+  }
+};
+
+// ============================================================================
+// Synchronization and Control Classes
+// ============================================================================
+
+// Enhanced PTX-based barrier system
+class PTXBarrier {
+public:
+  __device__ static void init_barrier(uint64_t *bar, int thread_count,
+                                      int transaction_count) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
+                 "r"(thread_count + transaction_count));
+  }
+
+  __device__ static void expect_bytes_tx(uint64_t *bar, uint32_t bytes) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            bar_ptr),
+        "r"(bytes));
+  }
+
+  __device__ static void wait(uint64_t *bar, int phase_bit) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n"
+                 ".reg .pred P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
+                 "@P1 bra.uni DONE;\n"
+                 "bra.uni LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(bar_ptr),
+                 "r"(phase_bit));
+  }
+
+  __device__ static void arrive(uint64_t *bar, uint32_t count = 1) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(
+            bar_ptr),
+        "r"(count)
+        : "memory");
+  }
+
+  __device__ static void wait_cluster(uint64_t *bar, int phase_bit) {
+    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n"
+                 ".reg .pred P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, "
+                 "[%0], %1;\n"
+                 "@P1 bra.uni DONE;\n"
+                 "bra.uni LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(bar_ptr),
+                 "r"(phase_bit));
+  }
+
+  __device__ static void arrive_cluster(uint64_t *bar, uint32_t cta_id,
+                                        uint32_t count = 1) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n\t"
+                 ".reg .b32 remAddr32;\n\t"
+                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                 "mbarrier.arrive.shared::cluster.b64 _, [remAddr32], %2;\n\t"
+                 "}" ::"r"(smem_addr),
+                 "r"(cta_id), "r"(count));
+  }
+};
+
+// WGMMA synchronization operations
+struct WGMMASyncOps {
+  __device__ static void warpgroup_arrive() {
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+  }
+
+  __device__ static void warpgroup_commit_batch() {
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+  }
+
+  template <int N> __device__ static void warpgroup_wait() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+  }
+
+  template <int N = 0> __device__ static inline void wg_commit_and_wait() {
+    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+    asm volatile("wgmma.commit_group.sync.aligned;\n"
+                 "wgmma.wait_group.sync.aligned %0;\n" ::"n"(N)
+                 : "memory");
+  }
 };
 
 // TMA Operations
@@ -136,132 +308,6 @@ public:
   }
 };
 
-// Enhanced PTX-based barrier system
-class PTXBarrier {
-public:
-  __device__ static void init_barrier(uint64_t *bar, int thread_count,
-                                      int transaction_count) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(bar_ptr),
-                 "r"(thread_count + transaction_count));
-  }
-
-  __device__ static void expect_bytes_tx(uint64_t *bar, uint32_t bytes) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile(
-        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-            bar_ptr),
-        "r"(bytes));
-  }
-
-  __device__ static void wait(uint64_t *bar, int phase_bit) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("{\n"
-                 ".reg .pred P1;\n"
-                 "LAB_WAIT:\n"
-                 "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n"
-                 "@P1 bra.uni DONE;\n"
-                 "bra.uni LAB_WAIT;\n"
-                 "DONE:\n"
-                 "}\n" ::"r"(bar_ptr),
-                 "r"(phase_bit));
-  }
-
-  __device__ static void arrive(uint64_t *bar, uint32_t count = 1) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-            bar_ptr),
-        "r"(count)
-        : "memory");
-  }
-
-  __device__ static void wait_cluster(uint64_t *bar, int phase_bit) {
-    uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("{\n"
-                 ".reg .pred P1;\n"
-                 "LAB_WAIT:\n"
-                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, "
-                 "[%0], %1;\n"
-                 "@P1 bra.uni DONE;\n"
-                 "bra.uni LAB_WAIT;\n"
-                 "DONE:\n"
-                 "}\n" ::"r"(bar_ptr),
-                 "r"(phase_bit));
-  }
-
-  __device__ static void arrive_cluster(uint64_t *bar, uint32_t cta_id,
-                                        uint32_t count = 1) {
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("{\n\t"
-                 ".reg .b32 remAddr32;\n\t"
-                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                 "mbarrier.arrive.shared::cluster.b64 _, [remAddr32], %2;\n\t"
-                 "}" ::"r"(smem_addr),
-                 "r"(cta_id), "r"(count));
-  }
-};
-
-// WGMMA Descriptor for shared memory
-class WGMMADescriptor {
-private:
-  static constexpr uint64_t SWIZZLE_BITS_128 = 1llu << 62;
-  static constexpr uint32_t MATRIX_ENCODE_MASK = 0x3FFFF;
-  static constexpr uint32_t MATRIX_ENCODE_SHIFT = 0x4;
-
-protected:
-  __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) {
-    return ((x & MATRIX_ENCODE_MASK) >> MATRIX_ENCODE_SHIFT);
-  }
-
-public:
-  __device__ static uint64_t make_smem_desc(bf16 *ptr) {
-    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-    uint64_t desc = 0x0000000000000000;
-
-    static constexpr uint64_t STRIDE = 16;
-    static constexpr uint64_t BLOCK_SIZE = 1024;
-
-    desc |= matrix_descriptor_encode(addr);
-    desc |= matrix_descriptor_encode(STRIDE) << 16;
-    desc |= matrix_descriptor_encode(BLOCK_SIZE) << 32;
-    desc |= SWIZZLE_BITS_128;
-
-    return desc;
-  }
-};
-
-// TMA Descriptor for global memory
-class TMADescriptor {
-public:
-  template <typename Config>
-  static CUtensorMap createDesc(typename Config::DataType *gmem_ptr,
-                                int global_height, int global_width,
-                                int block_height, int block_width) {
-    CUtensorMap desc;
-    // Move from static_assert to runtime assert
-    assert(block_width >= 64);
-    assert(global_width % 64 == 0);
-
-    uint64_t gmem_shape[5] = {64, (uint64_t)global_height,
-                              (uint64_t)global_width / 64, 1, 1};
-    uint64_t gmem_stride[5] = {sizeof(typename Config::DataType) * global_width,
-                               64 * sizeof(typename Config::DataType), 0, 0, 0};
-    uint32_t smem_shape[5] = {64, uint32_t(block_height),
-                              uint32_t(block_width / 64), 1, 1};
-    uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
-
-    CUresult result = cuTensorMapEncodeTiled(
-        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_ptr, gmem_shape,
-        gmem_stride, smem_shape, smem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-    assert(result == CUDA_SUCCESS);
-    return desc;
-  }
-};
-
 // Register Management
 class RegisterManager {
 public:
@@ -274,30 +320,11 @@ public:
   }
 };
 
-// WGMMA synchronization operations
-struct WGMMASyncOps {
-  __device__ static void warpgroup_arrive() {
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-  }
-
-  __device__ static void warpgroup_commit_batch() {
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-  }
-
-  template <int N> __device__ static void warpgroup_wait() {
-    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-    asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
-  }
-
-  template <int N = 0> __device__ static inline void wg_commit_and_wait() {
-    static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
-    asm volatile("wgmma.commit_group.sync.aligned;\n"
-                 "wgmma.wait_group.sync.aligned %0;\n" ::"n"(N)
-                 : "memory");
-  }
-};
-
 // =========== WGMMA (Tensor Core) ASM routines ================
+
+// ============================================================================
+// WGMMA Core Operations
+// ============================================================================
 
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma256(float d[16][8], bf16 *sA, bf16 *sB) {

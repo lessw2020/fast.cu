@@ -78,10 +78,10 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   extern __shared__ __align__(128) uint8_t smem[];
   SharedMemoryLayout<BM, BN, BK, QSIZE> &s =
       *reinterpret_cast<SharedMemoryLayout<BM, BN, BK, QSIZE> *>(smem);
+
   bf16 *sA = s.A, *sB = s.B, *sC = s.C;
   uint64_t *full = s.full, *empty = s.empty;
 
-  // Fails numerical verification:
   uint32_t cluster_id = ClusterOps::get_cluster_id();
 
   const int num_blocks_k = K / BK;
@@ -94,8 +94,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       PTXBarrier::init_barrier(&empty[i], 0, num_consumers * CLUSTERS);
     }
   }
-  asm volatile("barrier.cluster.arrive;\n" : :);
-  asm volatile("barrier.cluster.wait;\n" : :);
+  ClusterOps::cluster_sync();
+  // asm volatile("barrier.cluster.arrive;\n" : :);
+  // asm volatile("barrier.cluster.wait;\n" : :);
 
   Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
@@ -109,6 +110,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   if (wg_idx == 0) {
     constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
     RegisterManager::warpgroup_reg_dealloc<num_regs>();
+
     if (tid == 0) {
       int p = 0;
       int qidx = 0;
@@ -156,6 +158,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
         }
       }
     }
+    // Consumer
   } else {
     constexpr int num_regs =
         (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
@@ -180,12 +183,16 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
         PTXBarrier::wait(&full[qidx], p);
         WGMMASyncOps::warpgroup_arrive();
 #pragma unroll
+        // Compute for each sub-block
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
                            64 * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
           bf16 *wgmma_sB = sB + qidx * BK * BN;
           {
+            // Initial WGMMA compute
             wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
+
+            // Remaining iterations within 64 elem boundary
 #pragma unroll
             for (int k_it = 1; k_it < 64 / WGMMA_K; ++k_it) {
               wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
@@ -195,6 +202,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
             wgmma_sB += 64 * BN;
           }
 #pragma unroll
+          // Process remaining blocks
           for (int bk = 64; bk < BK; bk += 64) {
 #pragma unroll
             for (int k_it = 0; k_it < 64 / WGMMA_K; ++k_it) {
