@@ -6,6 +6,14 @@
 
 namespace wgmma_utils {
 
+// Shared Memory layout for matrix operations
+template <int BM, int BN, int BK, int QSIZE> struct SharedMemoryLayout {
+  alignas(128) bf16 A[BM * BK * QSIZE];
+  alignas(128) bf16 B[BK * BN * QSIZE];
+  alignas(128) bf16 C[BN * BM];
+  alignas(8) uint64_t full[QSIZE], empty[QSIZE];
+};
+
 // TMA Operations
 template <int BlockMajorSize, int BlockMinorSize>
 __host__ static inline CUtensorMap

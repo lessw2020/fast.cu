@@ -119,24 +119,6 @@ __device__ static __forceinline__ void wait_cluster(uint64_t *bar,
       "r"(kPhaseBit));
 }
 
-__device__ static inline void
-load_async_multicast(bf16 *dst, void const *src_tma_map, uint64_t *bar,
-                     int global_col_idx, int global_row_idx,
-                     uint16_t cluster_mask) {
-  uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-  uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-  asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
-               "complete_tx::bytes.multicast::cluster"
-               " [%0], [%1, {%3, %4, %5}], [%2], %6;"
-               :
-               : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0),
-                 "r"(global_row_idx), "r"(global_col_idx / 64),
-                 "h"(cluster_mask)
-               : "memory");
-}
-
 __device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id,
                                uint32_t count = 1) {
   uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -183,13 +165,6 @@ struct Schedule<1, NUM_SM, BM, BN, TM, TN> {
   }
 };
 
-template <int BM, int BN, int BK, int QSIZE> struct SMem {
-  alignas(128) bf16 A[BM * BK * QSIZE];
-  alignas(128) bf16 B[BK * BN * QSIZE];
-  alignas(128) bf16 C[BN * BM];
-  alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-};
-
 template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
           int CLUSTER_M, int CLUSTER_N>
 __global__
@@ -206,8 +181,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   assert((N / BN) % CLUSTER_N == 0);
 
   extern __shared__ __align__(128) uint8_t smem[];
-  SMem<BM, BN, BK, QSIZE> &s =
-      *reinterpret_cast<SMem<BM, BN, BK, QSIZE> *>(smem);
+  SharedMemoryLayout<BM, BN, BK, QSIZE> &s =
+      *reinterpret_cast<SharedMemoryLayout<BM, BN, BK, QSIZE> *>(smem);
   bf16 *sA = s.A, *sB = s.B, *sC = s.C;
   uint64_t *full = s.full, *empty = s.empty;
 
@@ -263,9 +238,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           if constexpr (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {
-              load_async_multicast(&sA[qidx * BK * BM], &tensorMapA,
-                                   &full[qidx], block_k_iter * BK,
-                                   num_block_m * BM, mask);
+              TMAOps::load_async_multicast(&sA[qidx * BK * BM], &tensorMapA,
+                                           &full[qidx], block_k_iter * BK,
+                                           num_block_m * BM, mask);
             }
           } else {
             load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
@@ -274,9 +249,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
           if constexpr (CLUSTER_M > 1) {
             if (rank_m == 0) {
-              load_async_multicast(&sB[qidx * BK * BN], &tensorMapB,
-                                   &full[qidx], block_k_iter * BK,
-                                   num_block_n * BN, col_mask << rank_n);
+              TMAOps::load_async_multicast(
+                  &sB[qidx * BK * BN], &tensorMapB, &full[qidx],
+                  block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
             }
           } else {
             load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
@@ -434,7 +409,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
 
   auto *kernel = matmulKernel10<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM,
                                 CLUSTER_M, CLUSTER_N>;
-  constexpr size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
+  constexpr size_t sMemSize = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
   static_assert(sMemSize < 256 * 1024);
   cudaCheck(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
