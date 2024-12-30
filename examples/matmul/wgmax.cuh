@@ -47,7 +47,7 @@ public:
 };
 
 // Cluster utility functions
-// Do we need the memory clobber????
+
 class ClusterOps {
 public:
   // Get the current cluster ID
@@ -57,13 +57,12 @@ public:
     return cluster_id;
   }
 
-  // Get the current cluster rank within cluster
+  // Get the current cluster rank
   __device__ static uint32_t get_cluster_rank() {
     uint32_t rank;
-    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank));
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
     return rank;
   }
-
   // Get cluster dimensions
   __device__ static void get_cluster_dims(uint32_t &dim_x, uint32_t &dim_y,
                                           uint32_t &dim_z) {

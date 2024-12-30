@@ -81,10 +81,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   bf16 *sA = s.A, *sB = s.B, *sC = s.C;
   uint64_t *full = s.full, *empty = s.empty;
 
-  uint32_t rank;
-  asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(rank) :);
   // Fails numerical verification:
-  // uint32_t rank = ClusterOps::get_cluster_rank();
+  uint32_t cluster_id = ClusterOps::get_cluster_id();
 
   const int num_blocks_k = K / BK;
   int wg_idx = threadIdx.x / 128;
@@ -101,11 +99,11 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
-      schedule(M, N, rank);
+      schedule(M, N, cluster_id);
 
-  asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
-  uint32_t rank_m = rank / CLUSTER_N;
-  uint32_t rank_n = rank % CLUSTER_N;
+  uint32_t cluster_rank = ClusterOps::get_cluster_rank();
+  uint32_t rank_m = cluster_rank / CLUSTER_N;
+  uint32_t rank_n = cluster_rank % CLUSTER_N;
 
   // Producer
   if (wg_idx == 0) {
