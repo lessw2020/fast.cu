@@ -64,14 +64,6 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
     wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
-template <uint32_t RegCount> __device__ void warpgroup_reg_alloc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
-template <uint32_t RegCount> __device__ void warpgroup_reg_dealloc() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
-}
-
 __device__ static __forceinline__ void
 init_barrier(uint64_t *bar, int thread_count, int transaction_count) {
   uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
@@ -100,20 +92,6 @@ __device__ static inline void load_async(bf16 *dst, void const *src_tma_map,
                :
                : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0),
                  "r"(global_row_idx), "r"(global_col_idx / 64)
-               : "memory");
-}
-
-__device__ static inline void store_async(void const *dst_tma_map, bf16 *src,
-                                          int global_col_idx,
-                                          int global_row_idx) {
-  uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst_tma_map);
-  uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
-
-  asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-               " [%0, {%2, %3, %4}], [%1];"
-               :
-               : "l"(tma_ptr), "r"(src_ptr), "n"(0), "r"(global_row_idx),
-                 "r"(global_col_idx / 64)
                : "memory");
 }
 
@@ -273,7 +251,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   // Producer
   if (wg_idx == 0) {
     constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-    warpgroup_reg_dealloc<num_regs>();
+    RegisterManager::warpgroup_reg_dealloc<num_regs>();
     if (tid == 0) {
       int p = 0;
       int qidx = 0;
@@ -323,7 +301,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   } else {
     constexpr int num_regs =
         (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-    warpgroup_reg_alloc<num_regs>();
+    RegisterManager::warpgroup_reg_alloc<num_regs>();
     float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
     --wg_idx;
     for (int qidx = 0; qidx < QSIZE; ++qidx) {
@@ -437,8 +415,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       }
       asm volatile("bar.sync 10, 256;\n");
       if (threadIdx.x == 128) {
-        store_async(&tensorMapC, (bf16 *)&sC[0], num_block_m * BM,
-                    num_block_n * BN);
+        TMAOps::store_async(&tensorMapC, (bf16 *)&sC[0], num_block_m * BM,
+                            num_block_n * BN);
         asm volatile("cp.async.bulk.commit_group;");
       }
     }

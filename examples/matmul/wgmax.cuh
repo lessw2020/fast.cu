@@ -65,6 +65,19 @@ public:
                  "r"(global_col_idx / 64), "h"(cluster_mask)
                  : "memory");
   }
+
+  __device__ static void store_async(void const *dst_tma_map, bf16 *src,
+                                     int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst_tma_map);
+    uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+                 " [%0, {%2, %3, %4}], [%1];"
+                 :
+                 : "l"(tma_ptr), "r"(src_ptr), "n"(0), "r"(global_row_idx),
+                   "r"(global_col_idx / 64)
+                 : "memory");
+  }
 };
 
 // Enhanced PTX-based barrier system
