@@ -254,8 +254,9 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       }
 
       // Output storage
-      /*
-      asm volatile("cp.async.bulk.wait_group 0;");
+
+      // asm volatile("cp.async.bulk.wait_group 0;");
+      WGMMAGlobalStore::wait_previous();
 
       int lane = tid % 32, warp = tid / 32;
       int row = warp * 16 + lane / 4;
@@ -285,31 +286,34 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 #undef ST
         }
       }
-      asm volatile("bar.sync 10, 256;\n");
+      // asm volatile("bar.sync 10, 256;\n");
+      WGMMAGlobalStore::sync_threads();
       if (threadIdx.x == 128) {
         TMAOps::store_async(&tensorMapC, (bf16 *)&sC[0], num_block_m * BM,
                             num_block_n * BN);
-        asm volatile("cp.async.bulk.commit_group;");
+        // asm volatile("cp.async.bulk.commit_group;");
+        WGMMAGlobalStore::commit_group();
       }
-      */
 
-      WGMMASyncOps::warpgroup_commit_batch();
-      WGMMASyncOps::warpgroup_wait<0>();
-      if (tid < CLUSTERS)
-        PTXBarrier::arrive_cluster(&empty[qidx], tid);
+      // WGMMASyncOps::warpgroup_commit_batch();
+      // WGMMASyncOps::warpgroup_wait<0>();
+      // if (tid < CLUSTERS)
+      //   PTXBarrier::arrive_cluster(&empty[qidx], tid);
+      //}
+
+      // Store results
+      // WGMMAGlobalStore::wait_previous();
+
+      // #pragma unroll
+      /*for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
+        output_handler.store_output(d, m_it);
+      }
+
+      WGMMAGlobalStore::sync_threads();
+      WGMMAGlobalStore::store_global(&tensorMapC, (bf16 *)&sC[0],
+                                     num_block_m * BM, num_block_n * BN);
+                                     */
     }
-
-    // Store results
-    WGMMAGlobalStore::wait_previous();
-
-#pragma unroll
-    for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-      output_handler.store_output(d, m_it);
-    }
-
-    WGMMAGlobalStore::sync_threads();
-    WGMMAGlobalStore::store_global(&tensorMapC, (bf16 *)&sC[0],
-                                   num_block_m * BM, num_block_n * BN);
   }
 }
 

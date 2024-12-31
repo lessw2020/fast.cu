@@ -181,8 +181,8 @@ struct WGMMAOutputHandler {
       : layout(thread_idx, warpgroup_idx),
         shared_out(sC + warpgroup_idx * B_WG_M * WGMMA_N) {}
 
-  template <typename RegT>
-  __device__ __forceinline__ void store_output(const RegT d[][8], int m_it) {
+  __device__ __forceinline__ void store_output(float d[][WGMMA_N / 16][8],
+                                               int m_it) {
     const int yo = m_it * WGMMA_M;
     const int row = layout.base_row;
 
@@ -193,7 +193,7 @@ struct WGMMAOutputHandler {
 
       // Store output in 8x2 blocks
       auto store = [&](int r, int c, int v) {
-        shared_out[c * B_WG_M + (r + yo)] = d[m_it][w_idx][v];
+        shared_out[c * B_WG_M + (r + yo)] = (d[m_it][w_idx][v]);
       };
 
       store(row, col, 0);
@@ -216,6 +216,10 @@ struct WGMMAGlobalStore {
 
   static __device__ __forceinline__ void sync_threads() {
     asm volatile("bar.sync 10, 256;\n");
+  }
+
+  static __device__ __forceinline__ void commit_group() {
+    asm volatile("cp.async.bulk.commit_group;");
   }
 
   template <typename T>
