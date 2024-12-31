@@ -412,6 +412,125 @@ public:
   }
 };
 
+// ====================
+// Group GEMM
+// ====================
+
+// Descriptor Manager for batch operations
+class BatchTMAManager {
+private:
+  struct BatchTMADescriptors {
+    CUtensorMap tma_A;
+    CUtensorMap tma_B;
+    CUtensorMap tma_C;
+  };
+
+public:
+  template <typename T>
+  static BatchTMADescriptors createDescriptors(T *A, T *B, T *C, int M, int N,
+                                               int K, int BM, int BN, int BK) {
+
+    BatchTMADescriptors descs;
+    descs.tma_A = TensorMapManager::create_tensor_map<BM, BK>(A, M, K);
+    descs.tma_B = TensorMapManager::create_tensor_map<BN, BK>(B, N, K);
+    descs.tma_C = TensorMapManager::create_tensor_map<BN, BM, false>(C, N, M);
+    return descs;
+  }
+};
+
+// Block scheduler for matrix operations
+class BlockScheduler {
+private:
+  int block;
+  int it;
+  int total_blocks_m;
+  int total_blocks_n;
+  int blocks_per_tile_m;
+  int blocks_per_tile_n;
+  int num_sm;
+
+public:
+  __device__ __forceinline__ BlockScheduler(int M, int N,   // Matrix dimensions
+                                            int BM, int BN, // Block dimensions
+                                            int TM, int TN, // Tile dimensions
+                                            int _num_sm,    // Number of SMs
+                                            int _block) {   // Block ID
+
+    block = _block;
+    it = 0;
+    num_sm = _num_sm;
+
+    total_blocks_m = CEIL_DIV(M, BM);
+    total_blocks_n = CEIL_DIV(N, BN);
+
+    assert(CEIL_DIV(M, BM) % TM == 0 && total_blocks_n % TN == 0);
+
+    blocks_per_tile_m = TM;
+    blocks_per_tile_n = TN;
+  }
+
+  __device__ __forceinline__ bool next(int &block_m, int &block_n) {
+    int num = it * num_sm + block;
+    if (num >= total_blocks_m * total_blocks_n) {
+      return false;
+    }
+
+    // Calculate current tile and position within tile
+    int blocks_per_tile = blocks_per_tile_m * blocks_per_tile_n;
+    int cur_tile = num / blocks_per_tile;
+    int cur_tile_pos = num % blocks_per_tile;
+
+    // Calculate block coordinates
+    int tiles_per_row = total_blocks_n / blocks_per_tile_n;
+    block_m = blocks_per_tile_m * (cur_tile / tiles_per_row);
+    block_n = blocks_per_tile_n * (cur_tile % tiles_per_row);
+
+    // Add offset within tile
+    block_m += cur_tile_pos / blocks_per_tile_n;
+    block_n += cur_tile_pos % blocks_per_tile_n;
+
+    ++it;
+    return true;
+  }
+
+  __device__ __forceinline__ static BlockScheduler
+  create(int M, int N, int BM, int BN, int TM, int TN, int num_sm, int block) {
+    return BlockScheduler(M, N, BM, BN, TM, TN, num_sm, block);
+  }
+};
+
+// Helper class for managing batch parameters
+class BatchParamsManager {
+public:
+  template <typename T> struct BatchParams {
+    int M;
+    int N;
+    int K;
+    T *A;
+    T *B;
+    T *C;
+    float alpha;
+    float beta;
+  };
+
+  template <typename T> struct BatchDescriptors {
+    BatchTMAManager::BatchTMADescriptors tma_descs;
+    BatchParams<T> params;
+  };
+
+  template <typename T>
+  static BatchDescriptors<T>
+  createBatchDescriptor(T *A, T *B, T *C, int M, int N, int K, int BM, int BN,
+                        int BK, float alpha = 1.0f, float beta = 0.0f) {
+
+    BatchDescriptors<T> desc;
+    desc.params = {M, N, K, A, B, C, alpha, beta};
+    desc.tma_descs =
+        BatchTMAManager::createDescriptors<T>(A, B, C, M, N, K, BM, BN, BK);
+    return desc;
+  }
+};
+
 // =========== WGMMA (Tensor Core) ASM routines ================
 
 // ============================================================================

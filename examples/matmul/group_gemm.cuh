@@ -10,6 +10,14 @@ namespace groupgemm {
 using namespace wgmma_utils;
 using bf16 = __nv_bfloat16;
 
+// Forward declaration of the kernel
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
+          int CLUSTER_M, int CLUSTER_N>
+__global__ void __launch_bounds__(NUM_THREADS)
+    __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1) computeBatchKernel(
+        const BatchParamsManager::BatchParams<bf16> *params,
+        const BatchTMAManager::BatchTMADescriptors *tma_descs, int batch_size);
+
 // Structure to hold the parameters for each GEMM in the batch
 struct GemmParams {
   int M;       // Matrix A rows
@@ -147,6 +155,134 @@ public:
 
     computeBatch<<<grid, block, smem_size>>>(d_params, d_tma_descriptors,
                                              batch_size);
+  }
+
+  // Main GroupGEMM class for handling batched operations
+  template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
+            int QSIZE = 3, int NUM_SM = 128, int CLUSTER_M = 2,
+            int CLUSTER_N = 1>
+  class GroupGemm {
+  private:
+    using BatchParams = BatchParamsManager::BatchParams<bf16>;
+    using BatchDescriptors = BatchParamsManager::BatchDescriptors<bf16>;
+
+    // Host-side storage
+    std::vector<BatchDescriptors> h_batch_descs;
+    BatchParams *d_params;
+    BatchTMAManager::BatchTMADescriptors *d_tma_descs;
+    int batch_size;
+
+  public:
+    GroupGemm() : d_params(nullptr), d_tma_descs(nullptr), batch_size(0) {}
+
+    ~GroupGemm() {
+      if (d_params)
+        cudaFree(d_params);
+      if (d_tma_descs)
+        cudaFree(d_tma_descs);
+    }
+
+    void initializeBatch(const std::vector<BatchParams> &params) {
+      batch_size = params.size();
+      h_batch_descs.resize(batch_size);
+
+      // Create descriptors for each GEMM in the batch
+      for (int i = 0; i < batch_size; i++) {
+        const auto &param = params[i];
+        h_batch_descs[i] = BatchParamsManager::createBatchDescriptor(
+            param.A, param.B, param.C, param.M, param.N, param.K, BM, BN, BK,
+            param.alpha, param.beta);
+      }
+
+      // Allocate and copy batch information to device
+      if (d_params)
+        cudaFree(d_params);
+      if (d_tma_descs)
+        cudaFree(d_tma_descs);
+
+      cudaMalloc(&d_params, batch_size * sizeof(BatchParams));
+      cudaMalloc(&d_tma_descs,
+                 batch_size * sizeof(BatchTMAManager::BatchTMADescriptors));
+
+      // Create separate arrays for params and descriptors
+      std::vector<BatchParams> h_params_array(batch_size);
+      std::vector<BatchTMAManager::BatchTMADescriptors> h_tma_array(batch_size);
+
+      for (int i = 0; i < batch_size; i++) {
+        h_params_array[i] = h_batch_descs[i].params;
+        h_tma_array[i] = h_batch_descs[i].tma_descs;
+      }
+
+      cudaMemcpy(d_params, h_params_array.data(),
+                 batch_size * sizeof(BatchParams), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_tma_descs, h_tma_array.data(),
+                 batch_size * sizeof(BatchTMAManager::BatchTMADescriptors),
+                 cudaMemcpyHostToDevice);
+    }
+
+    void launch() {
+      dim3 grid(NUM_SM);
+      dim3 block(NUM_THREADS);
+      size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
+
+      computeBatchKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
+                         CLUSTER_N>
+          <<<grid, block, smem_size>>>(d_params, d_tma_descs, batch_size);
+    }
+  };
+
+  // Kernel implementation
+  template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM,
+            int CLUSTER_M, int CLUSTER_N>
+  __global__ void
+  __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
+      computeBatchKernel(const BatchParamsManager::BatchParams<bf16> *params,
+                         const BatchTMAManager::BatchTMADescriptors *tma_descs,
+                         int batch_size) {
+    // Get batch index from block ID
+    int batch_idx = blockIdx.x / ((NUM_SM + batch_size - 1) / batch_size);
+    if (batch_idx >= batch_size)
+      return;
+
+    // Adjust block index for current batch
+    int adjusted_block_idx =
+        blockIdx.x % ((NUM_SM + batch_size - 1) / batch_size);
+
+    // Get parameters for current GEMM
+    const auto &cur_params = params[batch_idx];
+    const auto &cur_tma = tma_descs[batch_idx];
+
+    extern __shared__ __align__(128) uint8_t smem[];
+    SharedMemoryLayout<BM, BN, BK, QSIZE> &s =
+        *reinterpret_cast<SharedMemoryLayout<BM, BN, BK, QSIZE> *>(smem);
+
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < QSIZE; ++i) {
+        PTXBarrier::init_barrier(&s.full[i], 0, 1);
+        PTXBarrier::init_barrier(
+            &s.empty[i], 0, (NUM_THREADS / 128 - 1) * (CLUSTER_M * CLUSTER_N));
+      }
+    }
+    ClusterOps::cluster_sync();
+
+    // Use the new BlockScheduler
+    auto schedule = BlockScheduler::create(
+        cur_params.M, cur_params.N, BM, BN, 16 / CLUSTER_M, 8 / CLUSTER_N,
+        NUM_SM / (CLUSTER_M * CLUSTER_N), adjusted_block_idx);
+
+    uint32_t cluster_rank = ClusterOps::get_cluster_rank();
+    uint32_t rank_m = cluster_rank / CLUSTER_N;
+    uint32_t rank_n = cluster_rank % CLUSTER_N;
+
+    int wg_idx = threadIdx.x / 128;
+    int tid = threadIdx.x % 128;
+
+    if (wg_idx == 0) {
+      producerThread(s, schedule, rank_m, rank_n, tid, cur_params, cur_tma);
+    } else {
+      consumerThread(s, schedule, rank_m, rank_n, wg_idx - 1, tid, cur_params,
+                     cur_tma);
+    }
   }
 
 private:
