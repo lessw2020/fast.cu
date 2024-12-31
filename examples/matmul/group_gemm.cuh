@@ -150,7 +150,7 @@ public:
   }
 
 private:
-  // Producer and consumer thread implementations similar to before, but using
+  // Producer and consumer thread implementations using
   // batch parameters
   template <typename SchedType>
   __device__ void
