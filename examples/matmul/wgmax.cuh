@@ -10,6 +10,59 @@
 
 namespace wgmma_utils {
 
+// ======================
+// Forward Declares
+// ======================
+class TMAOps;
+
+class TMAOps {
+public:
+  __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
+                                    uint64_t *bar, int global_col_idx,
+                                    int global_row_idx) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
+                 ":complete_tx::bytes"
+                 " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(dst_ptr),
+                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
+                 "r"(global_col_idx / 64)
+                 : "memory");
+  }
+
+  __device__ static void load_async_multicast(bf16 *dst,
+                                              void const *const src_tma_map,
+                                              uint64_t *bar, int global_col_idx,
+                                              int global_row_idx,
+                                              uint16_t cluster_mask) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
+                 ":complete_tx::bytes.multicast::cluster"
+                 " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(dst_ptr),
+                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
+                 "r"(global_col_idx / 64), "h"(cluster_mask)
+                 : "memory");
+  }
+
+  __device__ static void store_async(void const *dst_tma_map, bf16 *src,
+                                     int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst_tma_map);
+    uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+                 " [%0, {%2, %3, %4}], [%1];"
+                 :
+                 : "l"(tma_ptr), "r"(src_ptr), "n"(0), "r"(global_row_idx),
+                   "r"(global_col_idx / 64)
+                 : "memory");
+  }
+};
+
 // ============================================================================
 // Core Data Structures
 // ============================================================================
@@ -90,6 +143,89 @@ public:
 
     assert(result == CUDA_SUCCESS);
     return desc;
+  }
+};
+
+// ======
+// Output
+// ======
+// Storage Operations for Global Memory
+// WGMMA Output Layout Handler
+struct WGMMAOutputLayout {
+  static constexpr int WARP_SIZE = 32;
+  static constexpr int OUTPUT_CHUNK = 16;
+
+  int tid;
+  int wg_idx;
+  int lane;
+  int warp;
+  int base_row;
+
+  __device__ WGMMAOutputLayout(int thread_idx, int warpgroup_idx)
+      : tid(thread_idx), wg_idx(warpgroup_idx), lane(thread_idx % WARP_SIZE),
+        warp(thread_idx / WARP_SIZE), base_row(warp * OUTPUT_CHUNK + lane / 4) {
+  }
+
+  __device__ __forceinline__ int get_col(int w) const {
+    return w + 2 * (tid % 4);
+  }
+};
+
+// WGMMA Output Storage Handler
+template <typename T, int B_WG_M, int WGMMA_M, int WGMMA_N>
+struct WGMMAOutputHandler {
+  WGMMAOutputLayout layout;
+  T *shared_out;
+
+  __device__ WGMMAOutputHandler(T *sC, int thread_idx, int warpgroup_idx)
+      : layout(thread_idx, warpgroup_idx),
+        shared_out(sC + warpgroup_idx * B_WG_M * WGMMA_N) {}
+
+  template <typename RegT>
+  __device__ __forceinline__ void store_output(const RegT d[][8], int m_it) {
+    const int yo = m_it * WGMMA_M;
+    const int row = layout.base_row;
+
+#pragma unroll
+    for (int w = 0; w < WGMMA_N; w += layout.OUTPUT_CHUNK) {
+      const int col = layout.get_col(w);
+      const int w_idx = w / layout.OUTPUT_CHUNK;
+
+      // Store output in 8x2 blocks
+      auto store = [&](int r, int c, int v) {
+        shared_out[c * B_WG_M + (r + yo)] = d[m_it][w_idx][v];
+      };
+
+      store(row, col, 0);
+      store(row + 8, col, 2);
+      store(row, col + 1, 1);
+      store(row + 8, col + 1, 3);
+      store(row, col + 8, 4);
+      store(row + 8, col + 8, 6);
+      store(row, col + 9, 5);
+      store(row + 8, col + 9, 7);
+    }
+  }
+};
+
+// Global memory storage handler for WGMMA output
+struct WGMMAGlobalStore {
+  static __device__ __forceinline__ void wait_previous() {
+    asm volatile("cp.async.bulk.wait_group 0;");
+  }
+
+  static __device__ __forceinline__ void sync_threads() {
+    asm volatile("bar.sync 10, 256;\n");
+  }
+
+  template <typename T>
+  static __device__ __forceinline__ void
+  store_global(const CUtensorMap *tensorMap, T *shared_data, int block_m,
+               int block_n) {
+    if (threadIdx.x == 128) {
+      TMAOps::store_async(tensorMap, shared_data, block_m, block_n);
+      asm volatile("cp.async.bulk.commit_group;");
+    }
   }
 };
 
@@ -257,54 +393,6 @@ public:
   // Only wait at the barrier
   __device__ static void cluster_wait() {
     asm volatile("barrier.cluster.wait;\n" : : : "memory");
-  }
-};
-
-class TMAOps {
-public:
-  __device__ static void load_async(bf16 *dst, void const *const src_tma_map,
-                                    uint64_t *bar, int global_col_idx,
-                                    int global_row_idx) {
-    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
-                 ":complete_tx::bytes"
-                 " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(dst_ptr),
-                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
-                 "r"(global_col_idx / 64)
-                 : "memory");
-  }
-
-  __device__ static void load_async_multicast(bf16 *dst,
-                                              void const *const src_tma_map,
-                                              uint64_t *bar, int global_col_idx,
-                                              int global_row_idx,
-                                              uint16_t cluster_mask) {
-    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
-    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-
-    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier:"
-                 ":complete_tx::bytes.multicast::cluster"
-                 " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(dst_ptr),
-                 "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx),
-                 "r"(global_col_idx / 64), "h"(cluster_mask)
-                 : "memory");
-  }
-
-  __device__ static void store_async(void const *dst_tma_map, bf16 *src,
-                                     int global_col_idx, int global_row_idx) {
-    uint64_t tma_ptr = reinterpret_cast<uint64_t>(dst_tma_map);
-    uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
-
-    asm volatile("cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-                 " [%0, {%2, %3, %4}], [%1];"
-                 :
-                 : "l"(tma_ptr), "r"(src_ptr), "n"(0), "r"(global_row_idx),
-                   "r"(global_col_idx / 64)
-                 : "memory");
   }
 };
 

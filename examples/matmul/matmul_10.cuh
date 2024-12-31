@@ -169,6 +169,10 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       if (tid < CLUSTERS)
         PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
+    // Setup output handler
+    WGMMAOutputHandler<bf16, B_WG_M, WGMMA_M, WGMMA_N> output_handler(
+        sC, threadIdx.x, wg_idx);
+
     int p = 0;
     int qidx = 0;
     int num_block_m, num_block_n;
@@ -249,6 +253,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           PTXBarrier::arrive_cluster(&empty[qidx], tid);
       }
 
+      // Output storage
+      /*
       asm volatile("cp.async.bulk.wait_group 0;");
 
       int lane = tid % 32, warp = tid / 32;
@@ -285,7 +291,25 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
                             num_block_n * BN);
         asm volatile("cp.async.bulk.commit_group;");
       }
+      */
+
+      WGMMASyncOps::warpgroup_commit_batch();
+      WGMMASyncOps::warpgroup_wait<0>();
+      if (tid < CLUSTERS)
+        PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
+
+    // Store results
+    WGMMAGlobalStore::wait_previous();
+
+#pragma unroll
+    for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
+      output_handler.store_output(d, m_it);
+    }
+
+    WGMMAGlobalStore::sync_threads();
+    WGMMAGlobalStore::store_global(&tensorMapC, (bf16 *)&sC[0],
+                                   num_block_m * BM, num_block_n * BN);
   }
 }
 
