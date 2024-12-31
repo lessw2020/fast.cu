@@ -37,6 +37,9 @@ bench: better_bench.cu
 plotter: plot_bench.cu
 	$(NVCC_BASE) $^ $(CUDA_OUTPUT_FILE)
 
+group_gemm: group_gemm.cu
+	$(NVCC_BASE) $^ $(CUDA_OUTPUT_FILE)
+
 
 
 matmulprofile: matmul
