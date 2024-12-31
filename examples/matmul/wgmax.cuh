@@ -418,7 +418,7 @@ public:
 
 // Descriptor Manager for batch operations
 class BatchTMAManager {
-private:
+public:
   struct BatchTMADescriptors {
     CUtensorMap tma_A;
     CUtensorMap tma_B;
