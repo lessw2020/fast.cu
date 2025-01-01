@@ -417,6 +417,8 @@ public:
 // ====================
 
 // Descriptor Manager for batch operations
+/*
+// Descriptor Manager for batch operations
 class BatchTMAManager {
 public:
   struct BatchTMADescriptors {
@@ -435,6 +437,163 @@ public:
     descs.tma_B = TensorMapManager::create_tensor_map<BN, BK>(B, N, K);
     descs.tma_C = TensorMapManager::create_tensor_map<BN, BM, false>(C, N, M);
     return descs;
+  }
+};
+*/
+//  orig
+class BatchTMAManager {
+public:
+  struct BatchTMADescriptors {
+    CUtensorMap tma_A;
+    CUtensorMap tma_B;
+    CUtensorMap tma_C;
+  };
+
+  template <typename T>
+  static BatchTMADescriptors createDescriptors(T *A, T *B, T *C, int M, int N,
+                                               int K, int BM, int BN, int BK) {
+
+    BatchTMADescriptors descs;
+
+    // Create TMA descriptors without template parameters
+    CUtensorMap tma_map_A;
+    {
+      void *gmem_ptr = (void *)A;
+      assert(BK >= 64);
+      assert(K % 64 == 0);
+
+      uint64_t gmem_shape[5] = {64, (uint64_t)M, (uint64_t)K / 64, 1, 1};
+      uint64_t gmem_stride[5] = {sizeof(T) * K, 64 * sizeof(T), 0, 0, 0};
+      uint32_t smem_shape[5] = {64, uint32_t(BM), uint32_t(BK / 64), 1, 1};
+      uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+      CUresult result = cuTensorMapEncodeTiled(
+          &tma_map_A,
+          std::is_same<T, __nv_bfloat16>::value
+              ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+              : CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+          3, gmem_ptr, gmem_shape, gmem_stride, smem_shape, smem_stride,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      assert(result == CUDA_SUCCESS);
+    }
+    descs.tma_A = tma_map_A;
+
+    // Similar for B
+    CUtensorMap tma_map_B;
+    {
+      void *gmem_ptr = (void *)B;
+      assert(BK >= 64);
+      assert(K % 64 == 0);
+
+      uint64_t gmem_shape[5] = {64, (uint64_t)N, (uint64_t)K / 64, 1, 1};
+      uint64_t gmem_stride[5] = {sizeof(T) * K, 64 * sizeof(T), 0, 0, 0};
+      uint32_t smem_shape[5] = {64, uint32_t(BN), uint32_t(BK / 64), 1, 1};
+      uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+      CUresult result = cuTensorMapEncodeTiled(
+          &tma_map_B,
+          std::is_same<T, __nv_bfloat16>::value
+              ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+              : CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+          3, gmem_ptr, gmem_shape, gmem_stride, smem_shape, smem_stride,
+          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      assert(result == CUDA_SUCCESS);
+    }
+    descs.tma_B = tma_map_B;
+
+    // For C
+    CUtensorMap tma_map_C;
+    {
+      void *gmem_ptr = (void *)C;
+      assert(BN >= 64);
+      assert(N % 64 == 0);
+
+      uint64_t gmem_shape[5] = {64, (uint64_t)N, (uint64_t)M / 64, 1, 1};
+      uint64_t gmem_stride[5] = {sizeof(T) * M, 64 * sizeof(T), 0, 0, 0};
+      uint32_t smem_shape[5] = {64, uint32_t(BN), uint32_t(BM / 64), 1, 1};
+      uint32_t smem_stride[5] = {1, 1, 1, 1, 1};
+
+      CUresult result = cuTensorMapEncodeTiled(
+          &tma_map_C,
+          std::is_same<T, __nv_bfloat16>::value
+              ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
+              : CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+          3, gmem_ptr, gmem_shape, gmem_stride, smem_shape, smem_stride,
+          CU_TENSOR_MAP_INTERLEAVE_NONE,
+          CU_TENSOR_MAP_SWIZZLE_NONE, // No swizzle for output
+          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      assert(result == CUDA_SUCCESS);
+    }
+    descs.tma_C = tma_map_C;
+
+    return descs;
+  }
+};
+/*
+// Helper class for managing batch parameters
+class BatchParamsManager {
+public:
+  template <typename T> struct BatchParams {
+    int M;
+    int N;
+    int K;
+    T *A;
+    T *B;
+    T *C;
+    float alpha;
+    float beta;
+  };
+
+  template <typename T> struct BatchDescriptors {
+    BatchTMAManager::BatchTMADescriptors tma_descs;
+    BatchParams<T> params;
+  };
+
+  template <typename T>
+  static BatchDescriptors<T>
+  createBatchDescriptor(T *A, T *B, T *C, int M, int N, int K, int BM, int BN,
+                        int BK, float alpha = 1.0f, float beta = 0.0f) {
+
+    BatchDescriptors<T> desc;
+    desc.params = {M, N, K, A, B, C, alpha, beta};
+    desc.tma_descs =
+        BatchTMAManager::createDescriptors<T>(A, B, C, M, N, K, BM, BN, BK);
+    return desc;
+  }
+};
+*/
+
+// Helper class for managing batch parameters
+class BatchParamsManager {
+public:
+  template <typename T> struct BatchParams {
+    int M;
+    int N;
+    int K;
+    T *A;
+    T *B;
+    T *C;
+    float alpha;
+    float beta;
+  };
+
+  template <typename T> struct BatchDescriptors {
+    BatchTMAManager::BatchTMADescriptors tma_descs;
+    BatchParams<T> params;
+  };
+
+  template <typename T>
+  static BatchDescriptors<T>
+  createBatchDescriptor(T *A, T *B, T *C, int M, int N, int K, int BM, int BN,
+                        int BK, float alpha = 1.0f, float beta = 0.0f) {
+
+    BatchDescriptors<T> desc;
+    desc.params = {M, N, K, A, B, C, alpha, beta};
+    desc.tma_descs =
+        BatchTMAManager::createDescriptors<T>(A, B, C, M, N, K, BM, BN, BK);
+    return desc;
   }
 };
 
@@ -496,38 +655,6 @@ public:
   __device__ __forceinline__ static BlockScheduler
   create(int M, int N, int BM, int BN, int TM, int TN, int num_sm, int block) {
     return BlockScheduler(M, N, BM, BN, TM, TN, num_sm, block);
-  }
-};
-
-// Helper class for managing batch parameters
-class BatchParamsManager {
-public:
-  template <typename T> struct BatchParams {
-    int M;
-    int N;
-    int K;
-    T *A;
-    T *B;
-    T *C;
-    float alpha;
-    float beta;
-  };
-
-  template <typename T> struct BatchDescriptors {
-    BatchTMAManager::BatchTMADescriptors tma_descs;
-    BatchParams<T> params;
-  };
-
-  template <typename T>
-  static BatchDescriptors<T>
-  createBatchDescriptor(T *A, T *B, T *C, int M, int N, int K, int BM, int BN,
-                        int BK, float alpha = 1.0f, float beta = 0.0f) {
-
-    BatchDescriptors<T> desc;
-    desc.params = {M, N, K, A, B, C, alpha, beta};
-    desc.tma_descs =
-        BatchTMAManager::createDescriptors<T>(A, B, C, M, N, K, BM, BN, BK);
-    return desc;
   }
 };
 
