@@ -1,3 +1,4 @@
+
 #pragma once
 #include "wgmax.cuh"
 #include <vector>
@@ -90,7 +91,6 @@ template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTER_M,
           int CLUSTER_N, int NUM_SM>
 __global__ void groupGemmKernel(int group_size, const GemmParams *params,
                                 const GemmDescriptors *descs) {
-
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
@@ -113,8 +113,11 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
   auto &smem =
       *reinterpret_cast<SharedMemoryLayout<BM, BN, BK, QSIZE> *>(shared_mem);
 
-  bf16 *sA = smem.A, *sB = smem.B, *sC = smem.C;
-  uint64_t *full = smem.full, *empty = smem.empty;
+  bf16 *sA = smem.A;
+  bf16 *sB = smem.B;
+  bf16 *sC = smem.C;
+  uint64_t *full = smem.full;
+  uint64_t *empty = smem.empty;
 
   uint32_t cluster_id = ClusterOps::get_cluster_id();
   const int num_blocks_k = param.K / BK;
@@ -131,10 +134,10 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
 
   ClusterOps::cluster_sync();
 
-  // Create schedule
-  Schedule<1, NUM_SM / (group_size * CLUSTERS), BM * CLUSTER_M, BN * CLUSTER_N,
-           16 / CLUSTER_M, 8 / CLUSTER_N>
-      schedule(param.M, param.N, adjusted_block_idx);
+  // Create schedule for this block
+  BlockScheduler schedule(param.M, param.N, BM, BN, 16 / CLUSTER_M,
+                          8 / CLUSTER_N, NUM_SM / (group_size * CLUSTERS),
+                          adjusted_block_idx);
 
   uint32_t cluster_rank = ClusterOps::get_cluster_rank();
   uint32_t rank_m = cluster_rank / CLUSTER_N;
@@ -155,54 +158,62 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
 
       int num_block_m, num_block_n;
       while (schedule.next(num_block_m, num_block_n)) {
-        num_block_n = num_block_n * CLUSTER_N + rank_n;
-        num_block_m = num_block_m * CLUSTER_M + rank_m;
+        //
 
-        // Validate block coordinates
-        bool is_valid =
-            (num_block_m * BM < param.M) && (num_block_n * BN < param.N);
+        while (schedule.next(num_block_m, num_block_n)) {
+          num_block_n = num_block_n * CLUSTER_N + rank_n;
+          num_block_m = num_block_m * CLUSTER_M + rank_m;
 
-        if (is_valid) {
-          for (int block_k_iter = 0; block_k_iter < num_blocks_k;
-               ++block_k_iter, ++qidx) {
-            if (qidx == QSIZE) {
-              qidx = 0;
-              p ^= 1;
-            }
+          // Validate block coordinates
+          bool is_valid =
+              (num_block_m * BM < param.M) && (num_block_n * BN < param.N);
 
-            PTXBarrier::wait(&empty[qidx], p);
-            PTXBarrier::expect_bytes_tx(&full[qidx],
-                                        (BK * BN + BK * BM) * sizeof(bf16));
-
-            // Load matrix A
-            if (CLUSTER_N > 1) {
-              uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
-              if (rank_n == 0 && block_k_iter * BK < param.K) {
-                TMAOps::load_async_multicast(&sA[qidx * BK * BM], &desc.tma_A,
-                                             &full[qidx], block_k_iter * BK,
-                                             num_block_m * BM, mask);
+          if (is_valid) {
+            for (int block_k_iter = 0; block_k_iter < num_blocks_k;
+                 ++block_k_iter, ++qidx) {
+              if (qidx == QSIZE) {
+                qidx = 0;
+                p ^= 1;
               }
-            } else if (block_k_iter * BK < param.K) {
-              TMAOps::load_async(&sA[qidx * BK * BM], &desc.tma_A, &full[qidx],
-                                 block_k_iter * BK, num_block_m * BM);
-            }
 
-            // Load matrix B
-            if (CLUSTER_M > 1) {
-              if (rank_m == 0 && block_k_iter * BK < param.K) {
-                TMAOps::load_async_multicast(
-                    &sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
-                    block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
+              PTXBarrier::wait(&empty[qidx], p);
+              PTXBarrier::expect_bytes_tx(&full[qidx],
+                                          (BK * BN + BK * BM) * sizeof(bf16));
+
+              // Load matrix A
+              if (CLUSTER_N > 1) {
+                uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                if (rank_n == 0 && block_k_iter * BK < param.K) {
+                  TMAOps::load_async_multicast(&sA[qidx * BK * BM], &desc.tma_A,
+                                               &full[qidx], block_k_iter * BK,
+                                               num_block_m * BM, mask);
+                }
+              } else if (block_k_iter * BK < param.K) {
+                TMAOps::load_async(&sA[qidx * BK * BM], &desc.tma_A,
+                                   &full[qidx], block_k_iter * BK,
+                                   num_block_m * BM);
               }
-            } else if (block_k_iter * BK < param.K) {
-              TMAOps::load_async(&sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
-                                 block_k_iter * BK, num_block_n * BN);
+
+              // Load matrix B
+              if (CLUSTER_M > 1) {
+                if (rank_m == 0 && block_k_iter * BK < param.K) {
+                  TMAOps::load_async_multicast(
+                      &sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
+                      block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
+                }
+              } else if (block_k_iter * BK < param.K) {
+                TMAOps::load_async(&sB[qidx * BK * BN], &desc.tma_B,
+                                   &full[qidx], block_k_iter * BK,
+                                   num_block_n * BN);
+              }
             }
           }
         }
       }
     }
-  } else {
+  }
+
+  else {
     // Consumer threads
     constexpr int num_regs =
         (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
@@ -312,23 +323,5 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
       }
     }
   }
-}
-
-void launch() {
-  static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
-
-  // Launch kernel with adjusted grid size
-  dim3 grid(NUM_SM * group_size);
-  dim3 block(NUM_THREADS);
-
-  size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
-
-  // Set shared memory size
-  cudaCheck(cudaFuncSetAttribute(
-      groupGemmKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-  // Launch kernel
-  groupGemmKernel<<<grid, block, smem_size>>>(group_size, params.data(),
-                                              descriptors.data());
 }
 } // namespace groupgemm
