@@ -93,11 +93,12 @@ public:
     dim3 grid(NUM_SM * group_size);
     dim3 block(NUM_THREADS);
     size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
-
-    cudaCheck(cudaFuncSetAttribute(
-        groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, CLUSTER_M, CLUSTER_N,
-                        NUM_SM>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    // todo - add cudacheck
+    cudaFuncSetAttribute(groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE,
+                                         CLUSTER_M, CLUSTER_N, NUM_SM>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_size);
+    ;
 
     groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, CLUSTER_M, CLUSTER_N,
                     NUM_SM><<<grid, block, smem_size>>>(
