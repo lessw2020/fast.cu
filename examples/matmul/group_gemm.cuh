@@ -23,6 +23,25 @@ struct GemmDescriptors {
   CUtensorMap tma_C;
 };
 
+// WGMMA dispatcher
+template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
+          int TransB>
+__device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
+                                      bf16 *sB) {
+  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
+                WGMMA_N == 192 || WGMMA_N == 208 || WGMMA_N == 256);
+  if constexpr (WGMMA_N == 256)
+    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 192)
+    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 128)
+    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 64)
+    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 32)
+    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+}
+
 // Forward declare kernel since it can't be a member function
 template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTER_M,
           int CLUSTER_N, int NUM_SM>
