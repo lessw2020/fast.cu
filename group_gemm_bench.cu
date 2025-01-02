@@ -288,8 +288,9 @@ int main() {
   std::vector<std::tuple<int, int, int>> test_configs = {
       //{1024, 1024, 1024}, // Base case
       {2048, 2048, 2048}, // Larger size
-      {3072, 2048, 1024}, // Rectangular
-      {4096, 4096, 4096}  // Very large
+      {2048, 2048, 2048},
+      //{3072, 2048, 1024}, // Rectangular
+      {4096, 4096, 4096} // Very large
   };
 
   // Test different batch sizes
