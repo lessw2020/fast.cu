@@ -15,7 +15,7 @@ namespace wgmma_utils {
 // ======================
 // Forward Declares
 // ======================
-class TMAOps;
+// class TMAOps;
 
 class TMAOps {
 public:
