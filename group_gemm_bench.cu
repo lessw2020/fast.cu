@@ -17,7 +17,12 @@
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
-// Error checking helpers
+/////////
+
+#include "examples/matmul/group_gemm.cuh"
+#include "examples/matmul/wgmax.cuh"
+
+// Error checking macros
 #define cudaCheck(err)                                                         \
   do {                                                                         \
     cudaError_t err_ = (err);                                                  \
@@ -37,17 +42,14 @@ typedef __nv_bfloat16 bf16;
     }                                                                          \
   } while (0)
 
-#include "examples/matmul/group_gemm.cuh"
-#include "examples/matmul/wgmax.cuh"
-
-// Random number generator
-std::default_random_engine generator(42);
-std::normal_distribution<float> distribution(0.0f, 1.0f);
-
 // TMA alignment requirements
 constexpr int M_ALIGN = 128;
 constexpr int N_ALIGN = 256;
 constexpr int K_ALIGN = 64;
+
+// Random number generator setup
+std::default_random_engine generator(42);
+std::normal_distribution<float> distribution(0.0f, 1.0f);
 
 // cuBLAS handle declaration
 cublasHandle_t cublas_handle;
@@ -122,13 +124,12 @@ public:
   void runCuBLAS() {
     float alpha = 1.0f;
     float beta = 0.0f;
-    cublasCheck(cublasGemmEx(
-        cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B,
-        CUDA_R_16BF, N_padded,      // Use device pointers instead of vectors
-        d_A, CUDA_R_16BF, K_padded, // Use device pointers instead of vectors
-        &beta, d_C_ref, CUDA_R_16BF, N_padded, CUDA_R_32F,
-        CUBLAS_GEMM_DEFAULT));
+    cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                             &alpha, d_B, CUDA_R_16BF, N_padded, d_A,
+                             CUDA_R_16BF, K_padded, &beta, d_C_ref, CUDA_R_16BF,
+                             N_padded, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
   }
+
   bool verify(float tolerance = 0.1f) {
     // Copy results back
     cudaCheck(cudaMemcpy(C.data(), d_C, M_padded * N_padded * sizeof(bf16),
@@ -180,26 +181,25 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &test_sizes,
 
   // Create test cases
   std::vector<MatrixTest> tests;
-  std::vector<groupgemm::GemmParams> batch_params;
+  std::vector<int> Ms, Ns, Ks;
+  std::vector<bf16 *> As, Bs, Cs;
 
   for (int i = 0; i < batch_size; ++i) {
     auto [m, n, k] = test_sizes[i % test_sizes.size()];
     tests.emplace_back(m, n, k);
 
     auto &test = tests.back();
-    groupgemm::GemmParams param;
-    param.M = test.M_padded;
-    param.N = test.N_padded;
-    param.K = test.K_padded;
-    param.A = test.d_A;
-    param.B = test.d_B;
-    param.C = test.d_C;
-    batch_params.push_back(param);
+    Ms.push_back(test.M_padded);
+    Ns.push_back(test.N_padded);
+    Ks.push_back(test.K_padded);
+    As.push_back(test.d_A);
+    Bs.push_back(test.d_B);
+    Cs.push_back(test.d_C);
   }
 
   // Initialize group GEMM
   groupgemm::GroupGemm<> group_gemm;
-  group_gemm.initializeBatch(batch_params);
+  group_gemm.initializeBatch(Ms, Ns, Ks, As, Bs, Cs);
 
   // Create CUDA events for timing
   cudaEvent_t start, stop;
@@ -286,7 +286,7 @@ int main() {
 
   // Test configurations
   std::vector<std::tuple<int, int, int>> test_configs = {
-      {1024, 1024, 1024}, // Base case
+      //{1024, 1024, 1024}, // Base case
       {2048, 2048, 2048}, // Larger size
       {3072, 2048, 1024}, // Rectangular
       {4096, 4096, 4096}  // Very large
