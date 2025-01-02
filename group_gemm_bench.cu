@@ -17,15 +17,40 @@
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
-// Random number generator
-std::default_random_engine generator(42);
-std::normal_distribution<float> distribution(0.0f, 1.0f);
+// Error checking helpers
+#define cudaCheck(err)                                                         \
+  do {                                                                         \
+    cudaError_t err_ = (err);                                                  \
+    if (err_ != cudaSuccess) {                                                 \
+      printf("CUDA error %d at %s:%d: %s\n", err_, __FILE__, __LINE__,         \
+             cudaGetErrorString(err_));                                        \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
+
+#define cublasCheck(err)                                                       \
+  do {                                                                         \
+    cublasStatus_t err_ = (err);                                               \
+    if (err_ != CUBLAS_STATUS_SUCCESS) {                                       \
+      printf("cuBLAS error %d at %s:%d\n", err_, __FILE__, __LINE__);          \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
 
 #include "examples/matmul/group_gemm.cuh"
 #include "examples/matmul/wgmax.cuh"
 
+// Random number generator
+std::default_random_engine generator(42);
+std::normal_distribution<float> distribution(0.0f, 1.0f);
+
 // cuBLAS handle
 cublasHandle_t cublas_handle;
+
+// TMA alignment requirements
+constexpr int M_ALIGN = 128; // Block size M alignment
+constexpr int N_ALIGN = 256; // Block size N alignment
+constexpr int K_ALIGN = 64;  // Block size K alignment
 
 // Helper function to initialize matrix with random values
 void initialize_matrix(std::vector<bf16> &matrix, size_t size) {
@@ -75,35 +100,49 @@ void cublas_gemm(int M, int N, int K, const bf16 *A, const bf16 *B, bf16 *C) {
   float alpha = 1.0f;
   float beta = 0.0f;
 
-  cudaCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
-                         &alpha, B, CUDA_R_16BF, N, A, CUDA_R_16BF, K, &beta, C,
-                         CUDA_R_16BF, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
+  cublasCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                           &alpha, B, CUDA_R_16BF, N, A, CUDA_R_16BF, K, &beta,
+                           C, CUDA_R_16BF, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 struct TestCase {
   int M, N, K;
+  int M_padded, N_padded, K_padded;
   std::vector<bf16> A, B, C, C_ref;
   bf16 *d_A, *d_B, *d_C, *d_C_ref;
 
   TestCase(int m, int n, int k) : M(m), N(n), K(k) {
-    // Pad dimensions to required alignment
-    M = ((M + 127) / 128) * 128;
-    N = ((N + 255) / 256) * 256;
-    K = ((K + 63) / 64) * 64;
+    // TMA requires specific alignments
+    M_padded = ((M + M_ALIGN - 1) / M_ALIGN) * M_ALIGN;
+    N_padded = ((N + N_ALIGN - 1) / N_ALIGN) * N_ALIGN;
+    K_padded = ((K + K_ALIGN - 1) / K_ALIGN) * K_ALIGN;
 
-    // Allocate host memory
-    size_t a_size = M * K;
-    size_t b_size = K * N;
-    size_t c_size = M * N;
+    printf("Original dimensions: M=%d, N=%d, K=%d\n", M, N, K);
+    printf("Padded dimensions: M=%d, N=%d, K=%d\n", M_padded, N_padded,
+           K_padded);
 
-    A.resize(a_size);
-    B.resize(b_size);
+    // Allocate host memory with padding
+    size_t a_size = M_padded * K_padded;
+    size_t b_size = K_padded * N_padded;
+    size_t c_size = M_padded * N_padded;
+
+    A.resize(a_size, __float2bfloat16(0.0f)); // Zero padding
+    B.resize(b_size, __float2bfloat16(0.0f)); // Zero padding
     C.resize(c_size);
     C_ref.resize(c_size);
 
-    // Initialize matrices
-    initialize_matrix(A, a_size);
-    initialize_matrix(B, b_size);
+    // Initialize the non-padded portions of matrices
+    for (int i = 0; i < M; ++i) {
+      for (int j = 0; j < K; ++j) {
+        A[i * K_padded + j] = __float2bfloat16(distribution(generator));
+      }
+    }
+
+    for (int i = 0; i < K; ++i) {
+      for (int j = 0; j < N; ++j) {
+        B[i * N_padded + j] = __float2bfloat16(distribution(generator));
+      }
+    }
 
     // Allocate device memory
     cudaCheck(cudaMalloc(&d_A, a_size * sizeof(bf16)));
@@ -116,6 +155,10 @@ struct TestCase {
                          cudaMemcpyHostToDevice));
     cudaCheck(cudaMemcpy(d_B, B.data(), b_size * sizeof(bf16),
                          cudaMemcpyHostToDevice));
+
+    // Zero initialize output matrices
+    cudaCheck(cudaMemset(d_C, 0, c_size * sizeof(bf16)));
+    cudaCheck(cudaMemset(d_C_ref, 0, c_size * sizeof(bf16)));
   }
 
   ~TestCase() {
@@ -139,8 +182,9 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
   // Prepare GroupGEMM parameters
   std::vector<groupgemm::GemmParams> batch_params;
   for (const auto &test : test_cases) {
-    batch_params.push_back(
-        {test.M, test.N, test.K, test.d_A, test.d_B, test.d_C, 1.0f, 0.0f});
+    batch_params.push_back({test.M_padded, test.N_padded,
+                            test.K_padded, // Use padded dimensions
+                            test.d_A, test.d_B, test.d_C, 1.0f, 0.0f});
   }
 
   // Create and initialize GroupGEMM
@@ -237,7 +281,7 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
 
 int main() {
   // Initialize cuBLAS
-  cudaCheck(cublasCreate(&cublas_handle));
+  cublasCheck(cublasCreate(&cublas_handle));
 
   // Test configurations - start with smaller sizes
   std::vector<std::tuple<int, int, int>> test_configs = {
@@ -256,6 +300,6 @@ int main() {
   }
 
   // Cleanup
-  cudaCheck(cublasDestroy(cublas_handle));
+  cublasCheck(cublasDestroy(cublas_handle));
   return 0;
 }
