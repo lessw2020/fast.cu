@@ -40,7 +40,6 @@ struct GemmDescriptors {
   CUtensorMap tma_B;
   CUtensorMap tma_C;
 };
-
 template <int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule {
   int block;
@@ -61,8 +60,9 @@ struct Schedule {
     if (valid) {
       params = &all_params[group_idx];
       it = 0;
-      total_blocks_m = (params->M + BM - 1) / BM;
-      total_blocks_n = (params->N + BN - 1) / BN;
+      // Round up dimensions to block size
+      total_blocks_m = CEIL_DIV(params->M, BM);
+      total_blocks_n = CEIL_DIV(params->N, BN);
     }
   }
 
@@ -70,19 +70,27 @@ struct Schedule {
     if (!valid)
       return false;
 
+    int total_tiles =
+        CEIL_DIV(total_blocks_m, TM) * CEIL_DIV(total_blocks_n, TN);
     int num = it * blocks_per_group + block;
-    if (num >= total_blocks_m * total_blocks_n)
+    if (num >= total_tiles * (TM * TN))
       return false;
 
-    int cur_tile = num / (TM * TN);
-    int cur_tile_pos = num % (TM * TN);
-    block_m = TM * (cur_tile / (total_blocks_n / TN));
-    block_n = TN * (cur_tile % (total_blocks_n / TN));
-    block_m += cur_tile_pos / TN;
-    block_n += cur_tile_pos % TN;
+    int tiles_m = CEIL_DIV(total_blocks_m, TM);
+    int tiles_n = CEIL_DIV(total_blocks_n, TN);
+    int tile_size = TM * TN;
+
+    int tile_idx = num / tile_size;
+    int pos_in_tile = num % tile_size;
+
+    int tile_m = tile_idx / tiles_n;
+    int tile_n = tile_idx % tiles_n;
+
+    block_m = tile_m * TM + pos_in_tile / TN;
+    block_n = tile_n * TN + pos_in_tile % TN;
 
     ++it;
-    return (block_m * BM < params->M) && (block_n * BN < params->N);
+    return (block_m < total_blocks_m) && (block_n < total_blocks_n);
   }
 
   __device__ __forceinline__ bool is_valid() const { return valid; }
@@ -276,7 +284,6 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
     }
   }
 }
-
 template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int CLUSTER_M = 2, int CLUSTER_N = 1, int NUM_SM = 128>
 class GroupGemm {
@@ -287,13 +294,21 @@ private:
 
   GemmDescriptors createDescriptors(const GemmParams &param) {
     GemmDescriptors desc;
-    cudaCheck(cudaDeviceSynchronize()); // Ensure previous operations complete
+    // Ensure proper alignment for TMA
+    assert(param.M % BM == 0 && param.N % BN == 0 && param.K % BK == 0);
+
+    // Create descriptors with synchronization
+    cudaCheck(cudaDeviceSynchronize());
     desc.tma_A =
         TensorMapManager::create_tensor_map<BM, BK>(param.A, param.M, param.K);
+    cudaCheck(cudaDeviceSynchronize());
     desc.tma_B =
         TensorMapManager::create_tensor_map<BN, BK>(param.B, param.N, param.K);
+    cudaCheck(cudaDeviceSynchronize());
     desc.tma_C = TensorMapManager::create_tensor_map<BN, BM, false>(
         param.C, param.N, param.M);
+    cudaCheck(cudaDeviceSynchronize());
+
     return desc;
   }
 
@@ -304,6 +319,7 @@ public:
     // Cleanup previous state
     descs.clear();
     params.clear();
+    cudaCheck(cudaDeviceSynchronize());
 
     params = batch_params;
     group_size = batch_params.size();
@@ -313,8 +329,6 @@ public:
     for (const auto &param : batch_params) {
       descs.push_back(createDescriptors(param));
     }
-
-    // Ensure descriptors are ready
     cudaCheck(cudaDeviceSynchronize());
   }
 
@@ -325,7 +339,12 @@ public:
     static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
     constexpr int blocks_per_sm = NUM_SM / (CLUSTER_M * CLUSTER_N);
 
-    dim3 grid(blocks_per_sm * group_size);
+    // Ensure grid size is proper multiple of cluster size
+    int grid_size = blocks_per_sm * group_size;
+    grid_size = (grid_size + CLUSTER_M * CLUSTER_N - 1) /
+                (CLUSTER_M * CLUSTER_N) * (CLUSTER_M * CLUSTER_N);
+
+    dim3 grid(grid_size);
     dim3 block(NUM_THREADS);
 
     size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
@@ -335,7 +354,6 @@ public:
                         CLUSTER_N>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    // Ensure previous operations are complete
     cudaCheck(cudaDeviceSynchronize());
 
     // Allocate and copy parameters and descriptors to device
@@ -343,6 +361,7 @@ public:
     GemmDescriptors *d_descs;
     cudaCheck(cudaMalloc(&d_params, group_size * sizeof(GemmParams)));
     cudaCheck(cudaMalloc(&d_descs, group_size * sizeof(GemmDescriptors)));
+    cudaCheck(cudaDeviceSynchronize());
 
     cudaCheck(cudaMemcpy(d_params, params.data(),
                          group_size * sizeof(GemmParams),
@@ -350,17 +369,15 @@ public:
     cudaCheck(cudaMemcpy(d_descs, descs.data(),
                          group_size * sizeof(GemmDescriptors),
                          cudaMemcpyHostToDevice));
-
-    // Ensure copies are complete before kernel launch
     cudaCheck(cudaDeviceSynchronize());
 
+    // Launch kernel
     groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
                     CLUSTER_N>
         <<<grid, block, smem_size>>>(group_size, d_params, d_descs);
-
-    // Wait for kernel to complete before freeing memory
     cudaCheck(cudaDeviceSynchronize());
 
+    // Cleanup
     cudaCheck(cudaFree(d_params));
     cudaCheck(cudaFree(d_descs));
   }
