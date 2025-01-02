@@ -1,5 +1,6 @@
 #pragma once
 #include "wgmax.cuh"
+#include <stdio.h>
 #include <vector>
 
 // Error checking helper
@@ -15,6 +16,25 @@
 
 namespace groupgemm {
 using namespace wgmma_utils;
+
+// WGMMA dispatcher
+template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
+          int TransB>
+__device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
+                                      bf16 *sB) {
+  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
+                WGMMA_N == 192 || WGMMA_N == 208 || WGMMA_N == 256);
+  if constexpr (WGMMA_N == 256)
+    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 192)
+    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 128)
+    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 64)
+    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+  if constexpr (WGMMA_N == 32)
+    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
+}
 
 // Per-GEMM parameters
 struct GemmParams {
@@ -39,25 +59,6 @@ template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTER_M,
 __global__ void groupGemmKernel(int group_size, const GemmParams *params,
                                 const GemmDescriptors *descs);
 
-// WGMMA dispatcher
-template <int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA,
-          int TransB>
-__device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
-                                      bf16 *sB) {
-  static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 ||
-                WGMMA_N == 192 || WGMMA_N == 208 || WGMMA_N == 256);
-  if constexpr (WGMMA_N == 256)
-    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
-  if constexpr (WGMMA_N == 192)
-    wgmma192<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
-  if constexpr (WGMMA_N == 128)
-    wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
-  if constexpr (WGMMA_N == 64)
-    wgmma64<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
-  if constexpr (WGMMA_N == 32)
-    wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
-}
-
 template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int CLUSTER_M = 2, int CLUSTER_N = 1, int NUM_SM = 128>
 class GroupGemm {
@@ -66,7 +67,6 @@ private:
   std::vector<GemmParams> params;
   int group_size;
 
-  // Create TMA descriptors for a single GEMM
   GemmDescriptors createDescriptors(const GemmParams &param) {
     GemmDescriptors desc;
     desc.tma_A =
@@ -102,8 +102,8 @@ public:
     static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
 
     // Calculate grid size ensuring proper alignment
-    int blocks_per_group = NUM_SM / (CLUSTER_M * CLUSTER_N);
-    dim3 grid(blocks_per_group * group_size);
+    constexpr int blocks_per_sm = NUM_SM / (CLUSTER_M * CLUSTER_N);
+    dim3 grid(blocks_per_sm * group_size);
     dim3 block(NUM_THREADS);
 
     size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
@@ -113,7 +113,6 @@ public:
                         NUM_SM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    // Ensure CUDA device is properly synchronized
     cudaCheck(cudaDeviceSynchronize());
 
     groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, CLUSTER_M, CLUSTER_N,
@@ -122,13 +121,6 @@ public:
   }
 };
 
-// Forward declare kernel
-template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTER_M,
-          int CLUSTER_N, int NUM_SM>
-__global__ void groupGemmKernel(int group_size, const GemmParams *params,
-                                const GemmDescriptors *descs);
-
-// Kernel implementation
 template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTER_M,
           int CLUSTER_N, int NUM_SM>
 __global__ void groupGemmKernel(int group_size, const GemmParams *params,
@@ -137,18 +129,27 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
   constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
+  constexpr int blocks_per_sm = NUM_SM / (CLUSTER_M * CLUSTER_N);
 
-  // Calculate group index and validate
-  int group_idx = blockIdx.x / (NUM_SM / group_size);
+  // Calculate indices
+  int group_idx = blockIdx.x / blocks_per_sm;
   if (group_idx >= group_size)
     return;
 
-  // Get parameters for this group member
+  int local_block_idx = blockIdx.x % blocks_per_sm;
+  int cluster_idx = local_block_idx / (blocks_per_sm / CLUSTERS);
+  int adjusted_block_idx = local_block_idx % (blocks_per_sm / CLUSTERS);
+
+  // Debug prints
+  if (threadIdx.x == 0) {
+    printf("Block %d: group=%d, local=%d, cluster=%d, adjusted=%d\n",
+           blockIdx.x, group_idx, local_block_idx, cluster_idx,
+           adjusted_block_idx);
+  }
+
+  // Get parameters
   const auto &param = params[group_idx];
   const auto &desc = descs[group_idx];
-
-  // Adjust block index for this group member
-  int adjusted_block_idx = blockIdx.x % (NUM_SM / group_size);
 
   // Shared memory setup
   extern __shared__ uint8_t shared_mem[];
@@ -175,25 +176,37 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
   }
 
   ClusterOps::cluster_sync();
-
-  // Ensure warpgroup sync before register allocation
   WGMMASyncOps::warpgroup_arrive();
+  __syncthreads();
 
-  // Create block schedule for this group
+  // Create block schedule
   BlockScheduler scheduler(param.M, param.N, BM, BN, 16 / CLUSTER_M,
-                           8 / CLUSTER_N, NUM_SM / (group_size * CLUSTERS),
+                           8 / CLUSTER_N, blocks_per_sm / CLUSTERS,
                            adjusted_block_idx);
 
   uint32_t cluster_rank = ClusterOps::get_cluster_rank();
   uint32_t rank_m = cluster_rank / CLUSTER_N;
   uint32_t rank_n = cluster_rank % CLUSTER_N;
 
+  // Register allocation and initialization
+  if (wg_idx == 0) {
+    WGMMASyncOps::warpgroup_arrive();
+    if (threadIdx.x < 128) {
+      constexpr int num_regs = 24;
+      RegisterManager::warpgroup_reg_dealloc<num_regs>();
+    }
+  } else {
+    WGMMASyncOps::warpgroup_arrive();
+    if (threadIdx.x >= 128) {
+      constexpr int num_regs = 160;
+      RegisterManager::warpgroup_reg_alloc<num_regs>();
+    }
+  }
+
+  __syncthreads();
+
   // Producer thread
   if (wg_idx == 0) {
-    WGMMASyncOps::warpgroup_sync();
-    constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-    RegisterManager::warpgroup_reg_dealloc<num_regs>();
-
     if (tid == 0) {
       int p = 0;
       int qidx = 0;
@@ -207,7 +220,6 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
         num_block_n = num_block_n * CLUSTER_N + rank_n;
         num_block_m = num_block_m * CLUSTER_M + rank_m;
 
-        // Validate block coordinates
         bool is_valid =
             (num_block_m * BM < param.M) && (num_block_n * BN < param.N);
 
@@ -223,29 +235,33 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
             PTXBarrier::expect_bytes_tx(&full[qidx],
                                         (BK * BN + BK * BM) * sizeof(bf16));
 
-            // Load matrix A
-            if (CLUSTER_N > 1) {
-              uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
-              if (rank_n == 0 && block_k_iter * BK < param.K) {
-                TMAOps::load_async_multicast(&sA[qidx * BK * BM], &desc.tma_A,
-                                             &full[qidx], block_k_iter * BK,
-                                             num_block_m * BM, mask);
+            if (block_k_iter * BK < param.K) {
+              // Load matrix A
+              if (CLUSTER_N > 1) {
+                uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                if (rank_n == 0) {
+                  TMAOps::load_async_multicast(&sA[qidx * BK * BM], &desc.tma_A,
+                                               &full[qidx], block_k_iter * BK,
+                                               num_block_m * BM, mask);
+                }
+              } else {
+                TMAOps::load_async(&sA[qidx * BK * BM], &desc.tma_A,
+                                   &full[qidx], block_k_iter * BK,
+                                   num_block_m * BM);
               }
-            } else if (block_k_iter * BK < param.K) {
-              TMAOps::load_async(&sA[qidx * BK * BM], &desc.tma_A, &full[qidx],
-                                 block_k_iter * BK, num_block_m * BM);
-            }
 
-            // Load matrix B
-            if (CLUSTER_M > 1) {
-              if (rank_m == 0 && block_k_iter * BK < param.K) {
-                TMAOps::load_async_multicast(
-                    &sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
-                    block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
+              // Load matrix B
+              if (CLUSTER_M > 1) {
+                if (rank_m == 0) {
+                  TMAOps::load_async_multicast(
+                      &sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
+                      block_k_iter * BK, num_block_n * BN, col_mask << rank_n);
+                }
+              } else {
+                TMAOps::load_async(&sB[qidx * BK * BN], &desc.tma_B,
+                                   &full[qidx], block_k_iter * BK,
+                                   num_block_n * BN);
               }
-            } else if (block_k_iter * BK < param.K) {
-              TMAOps::load_async(&sB[qidx * BK * BN], &desc.tma_B, &full[qidx],
-                                 block_k_iter * BK, num_block_n * BN);
             }
           }
         }
@@ -253,12 +269,7 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
     }
   } else {
     // Consumer threads
-    WGMMASyncOps::warpgroup_sync();
-    constexpr int num_regs =
-        (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-    RegisterManager::warpgroup_reg_alloc<num_regs>();
-
-    float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
+    float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8] = {};
     --wg_idx;
 
     // Initialize empty flags
@@ -266,10 +277,6 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
       if (tid < CLUSTERS)
         PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
-
-    // Setup output handler
-    WGMMAOutputHandler<bf16, B_WG_M, WGMMA_M, WGMMA_N> output_handler(
-        sC, threadIdx.x, wg_idx);
 
     int p = 0;
     int qidx = 0;
@@ -279,66 +286,42 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
       num_block_n = num_block_n * CLUSTER_N + rank_n;
       num_block_m = num_block_m * CLUSTER_M + rank_m;
 
-      // Validate block coordinates
       bool is_valid =
           (num_block_m * BM < param.M) && (num_block_n * BN < param.N);
 
       if (is_valid) {
-        // First block
-        {
+        for (int block_k_iter = 0; block_k_iter < num_blocks_k;
+             ++block_k_iter, ++qidx) {
           if (qidx == QSIZE) {
             qidx = 0;
             p ^= 1;
           }
 
           PTXBarrier::wait(&full[qidx], p);
-          WGMMASyncOps::warpgroup_arrive();
 
-// Process sub-blocks
-#pragma unroll
+#pragma unroll 1
           for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
             bf16 *wgmma_sA = sA + qidx * BK * BM +
                              64 * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
             bf16 *wgmma_sB = sB + qidx * BK * BN;
 
-            // Initial compute
-            wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
-
-            // Process remaining iterations within 64 elem boundary
-
-            // Process remaining iterations within 64 elem boundary
 #pragma unroll
-            for (int k_it = 1; k_it < 64 / WGMMA_K; ++k_it) {
-              wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                            &wgmma_sB[k_it * WGMMA_K]);
-            }
-
-            wgmma_sA += 64 * BM;
-            wgmma_sB += 64 * BN;
-
-// Process remaining blocks
-#pragma unroll
-            for (int bk = 64; bk < BK; bk += 64) {
-#pragma unroll
-              for (int k_it = 0; k_it < 64 / WGMMA_K; ++k_it) {
-                wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it],
-                                              &wgmma_sA[k_it * WGMMA_K],
-                                              &wgmma_sB[k_it * WGMMA_K]);
-              }
-              wgmma_sA += 64 * BM;
-              wgmma_sB += 64 * BN;
+            for (int k_it = 0; k_it < BK; k_it += WGMMA_K) {
+              WGMMASyncOps::warpgroup_arrive();
+              wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it],
+                                            &wgmma_sB[k_it]);
+              WGMMASyncOps::wg_commit_and_wait<0>();
             }
           }
 
-          WGMMASyncOps::warpgroup_commit_batch();
-          WGMMASyncOps::warpgroup_wait<0>();
-
-          if (tid < CLUSTERS)
+          if (tid < CLUSTERS) {
             PTXBarrier::arrive_cluster(&empty[qidx], tid);
+          }
         }
 
-        // Output storage
+        // Store results after computations
         WGMMAGlobalStore::wait_previous();
+        __syncthreads();
 
         int lane = tid % 32, warp = tid / 32;
         int row = warp * 16 + lane / 4;
@@ -351,7 +334,6 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
           for (int w = 0; w < WGMMA_N; w += 16) {
             int col = w + 2 * (tid % 4);
 
-// Store results using macro for cleaner code
 #define ST(i, j, v) block_sC[(j) * B_WG_M + (i) + yo] = v
 
             ST(row, col, d[m_it][w / 16][0]);
@@ -367,7 +349,7 @@ __global__ void groupGemmKernel(int group_size, const GemmParams *params,
           }
         }
 
-        WGMMAGlobalStore::sync_threads();
+        __syncthreads();
 
         if (threadIdx.x == 128) {
           TMAOps::store_async(&desc.tma_C, (bf16 *)&sC[0], num_block_m * BM,

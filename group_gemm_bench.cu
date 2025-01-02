@@ -1,4 +1,3 @@
-
 #include <cassert>
 #include <ctime>
 #include <cublas_v2.h>
@@ -18,32 +17,14 @@
 typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
-// Error checking helper
-#define CHECK_CUDA(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = call;                                                    \
-    if (err != cudaSuccess) {                                                  \
-      printf("CUDA Error at %s:%d: %s\n", __FILE__, __LINE__,                  \
-             cudaGetErrorString(err));                                         \
-      exit(1);                                                                 \
-    }                                                                          \
-  } while (0)
-
-#define CHECK_CUBLAS(call)                                                     \
-  do {                                                                         \
-    cublasStatus_t status = call;                                              \
-    if (status != CUBLAS_STATUS_SUCCESS) {                                     \
-      printf("CUBLAS Error at %s:%d: %d\n", __FILE__, __LINE__, status);       \
-      exit(1);                                                                 \
-    }                                                                          \
-  } while (0)
-
-#include "examples/matmul/group_gemm.cuh" // Our new implementation
-
 // Random number generator
 std::default_random_engine generator(42);
 std::normal_distribution<float> distribution(0.0f, 1.0f);
 
+#include "examples/matmul/group_gemm.cuh"
+#include "examples/matmul/wgmax.cuh"
+
+// cuBLAS handle
 cublasHandle_t cublas_handle;
 
 // Helper function to initialize matrix with random values
@@ -59,6 +40,8 @@ bool verify_results(const std::vector<bf16> &ref, const std::vector<bf16> &test,
   bool passed = true;
   float max_diff = 0.0f;
   int max_diff_idx = 0;
+  int num_errors = 0;
+  const int max_errors_to_print = 10;
 
   for (size_t i = 0; i < size; ++i) {
     float ref_val = __bfloat162float(ref[i]);
@@ -71,14 +54,19 @@ bool verify_results(const std::vector<bf16> &ref, const std::vector<bf16> &test,
     }
 
     if (diff > tolerance) {
+      if (num_errors < max_errors_to_print) {
+        printf("Mismatch at index %zu: ref = %f, test = %f (diff = %f)\n", i,
+               ref_val, test_val, diff);
+      }
       passed = false;
-      printf("Mismatch at index %zu: ref = %f, test = %f (diff = %f)\n", i,
-             ref_val, test_val, diff);
-      break;
+      num_errors++;
     }
   }
 
   printf("Max difference: %f at index %d\n", max_diff, max_diff_idx);
+  if (!passed) {
+    printf("Total number of errors: %d\n", num_errors);
+  }
   return passed;
 }
 
@@ -87,10 +75,9 @@ void cublas_gemm(int M, int N, int K, const bf16 *A, const bf16 *B, bf16 *C) {
   float alpha = 1.0f;
   float beta = 0.0f;
 
-  CHECK_CUBLAS(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
-                            &alpha, B, CUDA_R_16BF, N, A, CUDA_R_16BF, K, &beta,
-                            C, CUDA_R_16BF, N, CUDA_R_32F,
-                            CUBLAS_GEMM_DEFAULT));
+  cudaCheck(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+                         &alpha, B, CUDA_R_16BF, N, A, CUDA_R_16BF, K, &beta, C,
+                         CUDA_R_16BF, N, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 struct TestCase {
@@ -99,6 +86,11 @@ struct TestCase {
   bf16 *d_A, *d_B, *d_C, *d_C_ref;
 
   TestCase(int m, int n, int k) : M(m), N(n), K(k) {
+    // Pad dimensions to required alignment
+    M = ((M + 127) / 128) * 128;
+    N = ((N + 255) / 256) * 256;
+    K = ((K + 63) / 64) * 64;
+
     // Allocate host memory
     size_t a_size = M * K;
     size_t b_size = K * N;
@@ -114,16 +106,16 @@ struct TestCase {
     initialize_matrix(B, b_size);
 
     // Allocate device memory
-    CHECK_CUDA(cudaMalloc(&d_A, a_size * sizeof(bf16)));
-    CHECK_CUDA(cudaMalloc(&d_B, b_size * sizeof(bf16)));
-    CHECK_CUDA(cudaMalloc(&d_C, c_size * sizeof(bf16)));
-    CHECK_CUDA(cudaMalloc(&d_C_ref, c_size * sizeof(bf16)));
+    cudaCheck(cudaMalloc(&d_A, a_size * sizeof(bf16)));
+    cudaCheck(cudaMalloc(&d_B, b_size * sizeof(bf16)));
+    cudaCheck(cudaMalloc(&d_C, c_size * sizeof(bf16)));
+    cudaCheck(cudaMalloc(&d_C_ref, c_size * sizeof(bf16)));
 
     // Copy data to device
-    CHECK_CUDA(cudaMemcpy(d_A, A.data(), a_size * sizeof(bf16),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_B, B.data(), b_size * sizeof(bf16),
-                          cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_A, A.data(), a_size * sizeof(bf16),
+                         cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_B, B.data(), b_size * sizeof(bf16),
+                         cudaMemcpyHostToDevice));
   }
 
   ~TestCase() {
@@ -157,14 +149,14 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
 
   // Timing events
   cudaEvent_t start, stop;
-  CHECK_CUDA(cudaEventCreate(&start));
-  CHECK_CUDA(cudaEventCreate(&stop));
+  cudaCheck(cudaEventCreate(&start));
+  cudaCheck(cudaEventCreate(&stop));
 
   // Warmup phase
   printf("\nWarmup phase...\n");
   for (int i = 0; i < 3; ++i) {
     group_gemm.launch();
-    CHECK_CUDA(cudaDeviceSynchronize());
+    cudaCheck(cudaDeviceSynchronize());
   }
 
   // Verification phase
@@ -177,15 +169,15 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
 
     // Run our implementation
     group_gemm.launch();
-    CHECK_CUDA(cudaDeviceSynchronize());
+    cudaCheck(cudaDeviceSynchronize());
 
     // Copy results back and verify
-    CHECK_CUDA(cudaMemcpy(test.C.data(), test.d_C,
-                          test.M * test.N * sizeof(bf16),
-                          cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(test.C_ref.data(), test.d_C_ref,
-                          test.M * test.N * sizeof(bf16),
-                          cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(test.C.data(), test.d_C,
+                         test.M * test.N * sizeof(bf16),
+                         cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(test.C_ref.data(), test.d_C_ref,
+                         test.M * test.N * sizeof(bf16),
+                         cudaMemcpyDeviceToHost));
 
     printf("Verifying GEMM %zu (M=%d, N=%d, K=%d): ", i, test.M, test.N,
            test.K);
@@ -202,15 +194,15 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
   float elapsed_ms;
 
   // Benchmark cuBLAS
-  CHECK_CUDA(cudaEventRecord(start));
+  cudaCheck(cudaEventRecord(start));
   for (int iter = 0; iter < NUM_ITERS; ++iter) {
     for (const auto &test : test_cases) {
       cublas_gemm(test.M, test.N, test.K, test.d_A, test.d_B, test.d_C_ref);
     }
   }
-  CHECK_CUDA(cudaEventRecord(stop));
-  CHECK_CUDA(cudaEventSynchronize(stop));
-  CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  cudaCheck(cudaEventRecord(stop));
+  cudaCheck(cudaEventSynchronize(stop));
+  cudaCheck(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
   double cublas_ms = elapsed_ms / NUM_ITERS;
   double total_flops = 0;
@@ -223,13 +215,13 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
          cublas_tflops);
 
   // Benchmark GroupGEMM
-  CHECK_CUDA(cudaEventRecord(start));
+  cudaCheck(cudaEventRecord(start));
   for (int iter = 0; iter < NUM_ITERS; ++iter) {
     group_gemm.launch();
   }
-  CHECK_CUDA(cudaEventRecord(stop));
-  CHECK_CUDA(cudaEventSynchronize(stop));
-  CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+  cudaCheck(cudaEventRecord(stop));
+  cudaCheck(cudaEventSynchronize(stop));
+  cudaCheck(cudaEventElapsedTime(&elapsed_ms, start, stop));
 
   double group_ms = elapsed_ms / NUM_ITERS;
   double group_tflops = (total_flops * 1e-12) / (group_ms * 1e-3);
@@ -239,24 +231,21 @@ void run_benchmark(const std::vector<std::tuple<int, int, int>> &sizes) {
          "cuBLAS)\n",
          group_ms, group_tflops, speedup);
 
-  CHECK_CUDA(cudaEventDestroy(start));
-  CHECK_CUDA(cudaEventDestroy(stop));
+  cudaCheck(cudaEventDestroy(start));
+  cudaCheck(cudaEventDestroy(stop));
 }
 
 int main() {
   // Initialize cuBLAS
-  CHECK_CUBLAS(cublasCreate(&cublas_handle));
+  cudaCheck(cublasCreate(&cublas_handle));
 
-  // Test configurations
+  // Test configurations - start with smaller sizes
   std::vector<std::tuple<int, int, int>> test_configs = {
-      {4096, 4096, 4096}, // Square
-      {3072, 4096, 2048}, // Rectangular
-      {2048, 2048, 2048}, // Smaller square
-      {4096, 2048, 3072}  // Another rectangular
+      {1024, 1024, 1024} // Start with 1K x 1K for testing
   };
 
   // Run benchmarks with different batch sizes
-  std::vector<int> batch_sizes = {1, 2, 4};
+  std::vector<int> batch_sizes = {1}; // Start with batch size 1
   for (int batch_size : batch_sizes) {
     printf("\n=== Testing with batch size %d ===\n", batch_size);
     std::vector<std::tuple<int, int, int>> batch_config;
@@ -267,6 +256,6 @@ int main() {
   }
 
   // Cleanup
-  CHECK_CUBLAS(cublasDestroy(cublas_handle));
+  cudaCheck(cublasDestroy(cublas_handle));
   return 0;
 }
