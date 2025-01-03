@@ -2,6 +2,16 @@
 namespace M10 {
 using namespace wgmma_utils;
 
+// Helper macro for CUDA error checking
+#define cudaCheck(err)                                                         \
+  {                                                                            \
+    cudaError_t err_ = (err);                                                  \
+    if (err_ != cudaSuccess)                                                   \
+      throw std::runtime_error(std::string("CUDA error: ") +                   \
+                               cudaGetErrorString(err_) + " at " + __FILE__ +  \
+                               ":" + std::to_string(__LINE__));                \
+  }
+
 CUtensorMap d_tma_map_A;
 CUtensorMap d_tma_map_B;
 CUtensorMap d_tma_map_C;

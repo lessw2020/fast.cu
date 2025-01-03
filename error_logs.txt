@@ -1,23 +1,16 @@
+error: a parameter annotated with __grid_constant__ must have const-qualified type
+      groupMatmulKernel(const int group_size,
+      ^
+          detected during instantiation of "GroupM10::groupMatmulKernel" based on template arguments <128, 256, 64, 384, 3, 128, 2, 1> at line 347
 
-=== Testing batch size 1 ===
-Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
-GroupGemm initialized: blocks_per_group=64
-Initializing batch with 1 groups
-Configuration: BM=128, BN=256, BK=64, CLUSTER_M=2, CLUSTER_N=1
+examples/matmul/group_gemm.cuh(73): error: a parameter annotated with __grid_constant__ must have const-qualified type
+      groupMatmulKernel(const int group_size,
+      ^
+          detected during instantiation of "GroupM10::groupMatmulKernel" based on template arguments <128, 256, 64, 384, 3, 128, 2, 1> at line 347
 
-Group 0:
-  Dimensions: M=2048, N=2048, K=2048
-  Memory: A=0x7fb5e2a00000, B=0x7fb5e3200000, C=0x7fb5e4400000
-  Creating TMA descriptors...
-  Group 0 initialization complete
+examples/matmul/group_gemm.cuh(73): error: a parameter annotated with __grid_constant__ must have const-qualified type
+      groupMatmulKernel(const int group_size,
+      ^
+          detected during instantiation of "GroupM10::groupMatmulKernel" based on template arguments <128, 256, 64, 384, 3, 128, 2, 1> at line 347
 
-Warmup phase...
-
-Launching kernels:
-Shared memory size: 213120 bytes
-Grid configuration: blocks=128, threads=384
-
-Launching group 0:
-  Matrix: M=2048, N=2048, K=2048
-  Memory: A=0x7fb5e2a00000, B=0x7fb5e3200000, C=0x7fb5e4400000
-Segmentation fault (core dumped)
+3 errors detected in the compilation of "group_gemm_bench.cu".
