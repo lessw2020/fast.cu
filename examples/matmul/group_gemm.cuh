@@ -87,18 +87,18 @@ template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int NUM_SM = 128, int CLUSTER_M = 2, int CLUSTER_N = 1>
 __global__
 __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
-    groupGemmKernel(int group_size, const int *Ms, const int *Ns, const int *Ks,
+    groupGemmKernel(const __grid_constant__ GemmParams params,
                     const __grid_constant__ CUtensorMap tensorMapC,
                     const __grid_constant__ CUtensorMap tensorMapA,
-                    const __grid_constant__ CUtensorMap tensorMapB,
-                    int group_offset) {
+                    const __grid_constant__ CUtensorMap tensorMapB) {
+
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
   constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
-  assert((Ms[group_offset] / BM) % CLUSTER_M == 0);
-  assert((Ns[group_offset] / BN) % CLUSTER_N == 0);
+  // assert((Ms[group_offset] / BM) % CLUSTER_M == 0);
+  // assert((Ns[group_offset] / BN) % CLUSTER_N == 0);
 
   extern __shared__ __align__(128) uint8_t smem[];
   SharedMemoryLayout<BM, BN, BK, QSIZE> &s =
@@ -108,7 +108,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   uint64_t *full = s.full, *empty = s.empty;
 
   uint32_t cluster_id = ClusterOps::get_cluster_id();
-  const int num_blocks_k = Ks[group_offset] / BK;
+  const int num_blocks_k = params.K / BK;
   int wg_idx = threadIdx.x / 128;
   int tid = threadIdx.x % 128;
 
@@ -123,7 +123,8 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
-      schedule(Ms[group_offset], Ns[group_offset], cluster_id);
+      // schedule(Ms[group_offset], Ns[group_offset], cluster_id);
+      schedule(params.M, params.N, cluster_id);
 
   uint32_t cluster_rank = ClusterOps::get_cluster_rank();
   uint32_t rank_m = cluster_rank / CLUSTER_N;
@@ -324,19 +325,17 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
     }
   }
 }
+
 template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int CLUSTER_M = 2, int CLUSTER_N = 1, int NUM_SM = 128>
 class GroupGemm {
 private:
+  std::vector<GemmParams> params;
   std::vector<CUtensorMap> tmaAs, tmaBs, tmaCs;
-  std::vector<int> Ms, Ns, Ks;
-  int group_size;
   int blocks_per_group;
 
 public:
-  GroupGemm() : group_size(0) {
-    blocks_per_group = NUM_SM / (CLUSTER_M * CLUSTER_N);
-  }
+  GroupGemm() { blocks_per_group = NUM_SM / (CLUSTER_M * CLUSTER_N); }
 
   void initializeBatch(const std::vector<int> &m_dims,
                        const std::vector<int> &n_dims,
@@ -344,92 +343,68 @@ public:
                        const std::vector<bf16 *> &as,
                        const std::vector<bf16 *> &bs,
                        const std::vector<bf16 *> &cs) {
+    params.clear();
     tmaAs.clear();
     tmaBs.clear();
     tmaCs.clear();
-    Ms = m_dims;
-    Ns = n_dims;
-    Ks = k_dims;
 
-    group_size = m_dims.size();
+    const int group_size = m_dims.size();
     printf("Initializing batch with %d groups\n", group_size);
 
-    // Create TMA descriptors for each group
     for (int i = 0; i < group_size; ++i) {
       printf("Creating descriptors for group %d: M=%d, N=%d, K=%d\n", i,
              m_dims[i], n_dims[i], k_dims[i]);
 
-      cudaCheck(cudaDeviceSynchronize());
+      // Store parameters
+      params.push_back({m_dims[i], n_dims[i], k_dims[i], as[i], bs[i], cs[i]});
+
+      // Create TMA descriptors
       tmaAs.push_back(TensorMapManager::create_tensor_map<BM, BK>(
           as[i], m_dims[i], k_dims[i]));
-
-      cudaCheck(cudaDeviceSynchronize());
       tmaBs.push_back(TensorMapManager::create_tensor_map<BN, BK>(
           bs[i], n_dims[i], k_dims[i]));
-
-      cudaCheck(cudaDeviceSynchronize());
       tmaCs.push_back(TensorMapManager::create_tensor_map<BN, BM, false>(
           cs[i], n_dims[i], m_dims[i]));
     }
     cudaCheck(cudaDeviceSynchronize());
   }
+
   void launch() {
-    if (group_size == 0)
+    if (params.empty())
       return;
 
-    static_assert(NUM_SM % (CLUSTER_M * CLUSTER_N) == 0);
     constexpr size_t smem_size = sizeof(SharedMemoryLayout<BM, BN, BK, QSIZE>);
     static_assert(smem_size < 256 * 1024);
 
-    // For each group
-    for (int i = 0; i < group_size; i++) {
-      dim3 grid(NUM_SM); // Like matmul_10
-      dim3 block(NUM_THREADS);
+    cudaCheck(cudaFuncSetAttribute(
+        groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
+                        CLUSTER_N>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-      printf("Launching group %d: M=%d, N=%d, K=%d\n", i, Ms[i], Ns[i], Ks[i]);
+    dim3 grid(NUM_SM);
+    dim3 block(NUM_THREADS);
 
-      // Transfer dimensions to device
-      int *d_Ms;
-      int *d_Ns;
-      int *d_Ks;
-      cudaCheck(cudaMalloc(&d_Ms, group_size * sizeof(int)));
-      cudaCheck(cudaMalloc(&d_Ns, group_size * sizeof(int)));
-      cudaCheck(cudaMalloc(&d_Ks, group_size * sizeof(int)));
-      cudaCheck(cudaMemcpy(d_Ms, Ms.data(), group_size * sizeof(int),
-                           cudaMemcpyHostToDevice));
-      cudaCheck(cudaMemcpy(d_Ns, Ns.data(), group_size * sizeof(int),
-                           cudaMemcpyHostToDevice));
-      cudaCheck(cudaMemcpy(d_Ks, Ks.data(), group_size * sizeof(int),
-                           cudaMemcpyHostToDevice));
+    // Launch kernel for each group
+    for (size_t i = 0; i < params.size(); i++) {
+      printf("Launching group %d: M=%d, N=%d, K=%d\n", i, params[i].M,
+             params[i].N, params[i].K);
 
-      cudaCheck(cudaFuncSetAttribute(
-          groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
-                          CLUSTER_N>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      // Launch kernel for current group with appropriate TMA descriptors
-      cudaCheck(cudaDeviceSynchronize());
       groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
-                      CLUSTER_N><<<grid, block, smem_size>>>(
-          group_size, d_Ms, d_Ns, d_Ks, tmaCs[i], tmaAs[i], tmaBs[i], i);
-      cudaCheck(cudaDeviceSynchronize());
+                      CLUSTER_N>
+          <<<grid, block, smem_size>>>(params[i], tmaCs[i], tmaAs[i], tmaBs[i]);
 
-      // Cleanup
-      cudaCheck(cudaFree(d_Ms));
-      cudaCheck(cudaFree(d_Ns));
-      cudaCheck(cudaFree(d_Ks));
+      cudaCheck(cudaDeviceSynchronize());
     }
   }
 
   ~GroupGemm() {
+    params.clear();
     tmaAs.clear();
     tmaBs.clear();
     tmaCs.clear();
-    Ms.clear();
-    Ns.clear();
-    Ks.clear();
-    group_size = 0;
   }
 };
 
 } // namespace groupgemm
+
+////////////////////
