@@ -85,11 +85,17 @@ struct Schedule {
   }
 };
 
+// Matmul Kernel
+// ================
+
 template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int NUM_SM = 128, int CLUSTER_M = 2, int CLUSTER_N = 1>
 __global__
 __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
-    groupGemmKernel(const __grid_constant__ GemmParams params) {
+    groupGemmKernel(const __grid_constant__ GemmParams params,
+                    const __grid_constant__ CUtensorMap tensorMapC,
+                    const __grid_constant__ CUtensorMap tensorMapA,
+                    const __grid_constant__ CUtensorMap tensorMapB) {
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
@@ -126,26 +132,26 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   ClusterOps::cluster_sync();
 
-  Schedule<1, NUM_SM / CLUSTERS, BM, BN, 16 / CLUSTER_M, 8 / CLUSTER_N>
+  Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
+           8 / CLUSTER_N>
       schedule(params.M, params.N, cluster_id);
 
   if (wg_idx == 0) {
     // Producer thread
-    constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-    RegisterManager::warpgroup_reg_dealloc<num_regs>();
+    RegisterManager::warpgroup_reg_dealloc<32>(); // Changed to always use 32
 
     if (tid == 0) {
-      DEBUG_PRINT("Producer thread starting: wg_idx=%d, tid=%d\n", wg_idx, tid);
       int p = 0;
       int qidx = 0;
+      uint32_t col_mask = 0;
+      for (int i = 0; i < CLUSTER_M; ++i) {
+        col_mask |= (1 << (i * CLUSTER_N));
+      }
 
       int num_block_m, num_block_n;
       while (schedule.next(num_block_m, num_block_n)) {
         num_block_n = num_block_n * CLUSTER_N + rank_n;
         num_block_m = num_block_m * CLUSTER_M + rank_m;
-
-        DEBUG_PRINT("Producer processing block: m=%d, n=%d\n", num_block_m,
-                    num_block_n);
 
         for (int block_k_iter = 0; block_k_iter < num_blocks_k;
              ++block_k_iter, ++qidx) {
@@ -158,35 +164,26 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           PTXBarrier::expect_bytes_tx(&full[qidx],
                                       (BK * BN + BK * BM) * sizeof(bf16));
 
-          DEBUG_PRINT("Loading k_iter=%d: offset_a=%d, offset_b=%d\n",
-                      block_k_iter, block_k_iter * BK, num_block_m * BM);
-
-          TMAOps::load_async(&sA[qidx * BK * BM], &params.tmaA, &full[qidx],
+          // Simplified load operations for initial debugging
+          TMAOps::load_async(&sA[qidx * BK * BM], &tensorMapA, &full[qidx],
                              block_k_iter * BK, num_block_m * BM);
 
-          TMAOps::load_async(&sB[qidx * BK * BN], &params.tmaB, &full[qidx],
+          TMAOps::load_async(&sB[qidx * BK * BN], &tensorMapB, &full[qidx],
                              block_k_iter * BK, num_block_n * BN);
         }
       }
-      DEBUG_PRINT("Producer thread complete\n");
     }
   } else {
     // Consumer threads
-    DEBUG_PRINT("Consumer thread starting: wg_idx=%d\n", wg_idx - 1);
-    constexpr int num_regs =
-        (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-    RegisterManager::warpgroup_reg_alloc<num_regs>();
+    RegisterManager::warpgroup_reg_alloc<160>(); // Changed to always use 160
 
-    float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
+    float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8]{}; // Zero-initialize
     --wg_idx;
 
     for (int qidx = 0; qidx < QSIZE; ++qidx) {
       if (tid < CLUSTERS)
         PTXBarrier::arrive_cluster(&empty[qidx], tid);
     }
-
-    WGMMAOutputHandler<bf16, B_WG_M, WGMMA_M, WGMMA_N> output_handler(
-        sC, threadIdx.x, wg_idx);
 
     int p = 0;
     int qidx = 0;
@@ -196,53 +193,32 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
       num_block_n = num_block_n * CLUSTER_N + rank_n;
       num_block_m = num_block_m * CLUSTER_M + rank_m;
 
-      DEBUG_PRINT("Consumer %d processing block: m=%d, n=%d\n", wg_idx,
-                  num_block_m, num_block_n);
-
-      if (qidx == QSIZE) {
-        qidx = 0;
-        p ^= 1;
-        DEBUG_PRINT("Consumer queue wrap: qidx=0, p=%d\n", p);
-      }
-
-      PTXBarrier::wait(&full[qidx], p);
-      WGMMASyncOps::warpgroup_arrive();
-
-#pragma unroll
-      for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-        bf16 *wgmma_sA = sA + qidx * BK * BM +
-                         64 * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
-        bf16 *wgmma_sB = sB + qidx * BK * BN;
-
-        wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], &wgmma_sA[0], &wgmma_sB[0]);
-
-#pragma unroll
-        for (int k_it = 1; k_it < 64 / WGMMA_K; ++k_it) {
-          wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                        &wgmma_sB[k_it * WGMMA_K]);
+      {
+        if (qidx == QSIZE) {
+          qidx = 0;
+          p ^= 1;
         }
-        wgmma_sA += 64 * BM;
-        wgmma_sB += 64 * BN;
 
-#pragma unroll
-        for (int bk = 64; bk < BK; bk += 64) {
-#pragma unroll
-          for (int k_it = 0; k_it < 64 / WGMMA_K; ++k_it) {
+        PTXBarrier::wait(&full[qidx], p);
+        WGMMASyncOps::warpgroup_arrive();
+
+        // First compute block
+        for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
+          bf16 *wgmma_sA = sA + qidx * BK * BM +
+                           64 * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
+          bf16 *wgmma_sB = sB + qidx * BK * BN;
+
+          // Initial WGMMA with zero accumulator
+          wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d[m_it], wgmma_sA, wgmma_sB);
+
+          for (int k_it = 1; k_it < BK / WGMMA_K; ++k_it) {
             wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
                                           &wgmma_sB[k_it * WGMMA_K]);
           }
-          wgmma_sA += 64 * BM;
-          wgmma_sB += 64 * BN;
         }
       }
 
-      WGMMASyncOps::warpgroup_commit_batch();
-      WGMMASyncOps::warpgroup_wait<0>();
-
-      if (tid < CLUSTERS)
-        PTXBarrier::arrive_cluster(&empty[qidx], tid);
-      ++qidx;
-
+      // Remaining k-blocks
       for (int block_k_iter = 1; block_k_iter < num_blocks_k;
            ++block_k_iter, ++qidx) {
         if (qidx == QSIZE) {
@@ -253,47 +229,36 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
         PTXBarrier::wait(&full[qidx], p);
         WGMMASyncOps::warpgroup_arrive();
 
-#pragma unroll
         for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
           bf16 *wgmma_sA = sA + qidx * BK * BM +
                            64 * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
           bf16 *wgmma_sB = sB + qidx * BK * BN;
 
-#pragma unroll
-          for (int bk = 0; bk < BK; bk += 64) {
-#pragma unroll
-            for (int k_it = 0; k_it < 64 / WGMMA_K; ++k_it) {
-              wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
-                                            &wgmma_sB[k_it * WGMMA_K]);
-            }
-            wgmma_sA += 64 * BM;
-            wgmma_sB += 64 * BN;
+          for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
+            wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K],
+                                          &wgmma_sB[k_it * WGMMA_K]);
           }
         }
 
         WGMMASyncOps::warpgroup_commit_batch();
         WGMMASyncOps::warpgroup_wait<0>();
+
         if (tid < CLUSTERS)
           PTXBarrier::arrive_cluster(&empty[qidx], tid);
       }
 
+      // Store results
       WGMMAGlobalStore::wait_previous();
-
-      DEBUG_PRINT("Consumer %d storing results\n", wg_idx);
 
       int lane = tid % 32, warp = tid / 32;
       int row = warp * 16 + lane / 4;
       bf16 *block_sC = sC + wg_idx * B_WG_M * BN;
 
-#pragma unroll
       for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
         int yo = m_it * WGMMA_M;
-#pragma unroll
         for (int w = 0; w < WGMMA_N; w += 16) {
           int col = w + 2 * (tid % 4);
-
 #define ST(i, j, v) block_sC[(j) * B_WG_M + (i) + yo] = v
-
           ST(row, col, d[m_it][w / 16][0]);
           ST(row + 8, col, d[m_it][w / 16][2]);
           ST(row, col + 1, d[m_it][w / 16][1]);
@@ -302,24 +267,21 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           ST(row + 8, col + 8, d[m_it][w / 16][6]);
           ST(row, col + 9, d[m_it][w / 16][5]);
           ST(row + 8, col + 9, d[m_it][w / 16][7]);
-
 #undef ST
         }
       }
 
       WGMMAGlobalStore::sync_threads();
       if (threadIdx.x == 128) {
-        DEBUG_PRINT("Storing to global memory: C[%d,%d]\n", num_block_m * BM,
-                    num_block_n * BN);
-        TMAOps::store_async(&params.tmaC, (bf16 *)&sC[0], num_block_m * BM,
+        TMAOps::store_async(&tensorMapC, (bf16 *)&sC[0], num_block_m * BM,
                             num_block_n * BN);
         WGMMAGlobalStore::commit_group();
       }
     }
-    DEBUG_PRINT("Consumer %d complete\n", wg_idx);
   }
 }
-
+// GroupGemm launcher
+// ===================
 template <int BM = 128, int BN = 256, int BK = 64, int NUM_THREADS = 128 * 3,
           int QSIZE = 3, int CLUSTER_M = 2, int CLUSTER_N = 1, int NUM_SM = 128>
 class GroupGemm {

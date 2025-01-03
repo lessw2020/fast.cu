@@ -1,25 +1,5 @@
-=== Testing batch size 1 ===
-Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
-Initializing batch with 1 groups
-Configuration: BM=128, BN=256, BK=64, CLUSTER_M=2, CLUSTER_N=1
-
-Group 0:
-  Dimensions: M=2048, N=2048, K=2048
-  Memory: A=0x7f968ca00000, B=0x7f968d200000, C=0x7f968e400000
-  Creating TMA descriptors...
-  Group 0 initialization complete
-
-Warmup phase...
-
-Launching GroupGemm kernels:
-Shared memory size: 213120 bytes
-
-Launching group 0:
-  Grid: 128 blocks, 384 threads/block
-  Matrix: M=2048, N=2048, K=2048
-Kernel start: cluster_id=0, cluster_rank=0, rank_m=0, rank_n=0
-Initialized barriers 0: full=0x7f9700034400, empty=0x7f9700034418
-Initialized barriers 1: full=0x7f9700034408, empty=0x7f9700034420
-Initialized barriers 2: full=0x7f9700034410, empty=0x7f9700034428
-Schedule initialized: M=2048, N=2048, total_blocks_m=16, total_blocks_n=8
-CUDA error 715 at examples/matmul/group_gemm.cuh:412: an illegal instruction was encountered
+error: no instance of function template "groupgemm::groupGemmKernel" matches the argument list
+            argument types are: (groupgemm::GemmParams)
+        groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
+        ^
+          detected during instantiation of "void groupgemm::GroupGemm<BM, BN, BK, NUM_THREADS, QSIZE, CLUSTER_M, CLUSTER_N, NUM_SM>::launch() [with BM=128, BN=256, BK=64, NUM_THREADS=384, QSIZE=3, CLUSTER_M=2, CLUSTER_N=1, NUM_SM=128]" at line 212 of group_gemm_bench.cu
