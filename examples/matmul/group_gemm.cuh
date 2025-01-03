@@ -35,9 +35,10 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N / 16][8], bf16 *sA,
     wgmma32<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, sA, sB);
 }
 
-// Per-GEMM parameters
 struct GemmParams {
   int M, N, K;
+  int total_blocks_m; // Added for scheduling
+  int total_blocks_n; // Added for scheduling
   bf16 *A;
   bf16 *B;
   bf16 *C;
@@ -51,19 +52,18 @@ struct GemmDescriptors {
 };
 
 //// /////
-
 template <int VERSION, int NUM_SM, int BM, int BN, int TM, int TN>
 struct Schedule {
   int block;
   int it;
   int total_blocks_m, total_blocks_n;
 
-  __device__ __forceinline__ Schedule(int M, int N, int _block) {
+  __device__ __forceinline__ Schedule(const GemmParams &params, int _block) {
     block = _block;
     it = 0;
-    total_blocks_m = CEIL_DIV(M, BM);
-    total_blocks_n = CEIL_DIV(N, BN);
-    assert(CEIL_DIV(M, BM) % TM == 0 && total_blocks_n % TN == 0);
+    total_blocks_m = CEIL_DIV(params.M, BM);
+    total_blocks_n = CEIL_DIV(params.N, BN);
+    assert(CEIL_DIV(params.M, BM) % TM == 0 && total_blocks_n % TN == 0);
   }
 
   __device__ __forceinline__ bool next(int &block_m, int &block_n) {
@@ -91,14 +91,14 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
                     const __grid_constant__ CUtensorMap tensorMapC,
                     const __grid_constant__ CUtensorMap tensorMapA,
                     const __grid_constant__ CUtensorMap tensorMapB) {
-
   constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
   constexpr int num_consumers = (NUM_THREADS / 128) - 1;
   constexpr int B_WG_M = BM / num_consumers;
   constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
 
-  // assert((Ms[group_offset] / BM) % CLUSTER_M == 0);
-  // assert((Ns[group_offset] / BN) % CLUSTER_N == 0);
+  // Verify dimensions are compatible with clustering
+  assert((params.M / BM) % CLUSTER_M == 0);
+  assert((params.N / BN) % CLUSTER_N == 0);
 
   extern __shared__ __align__(128) uint8_t smem[];
   SharedMemoryLayout<BM, BN, BK, QSIZE> &s =
@@ -112,6 +112,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
   int wg_idx = threadIdx.x / 128;
   int tid = threadIdx.x % 128;
 
+  // Initialize barriers
   if (threadIdx.x == 0) {
     for (int i = 0; i < QSIZE; ++i) {
       PTXBarrier::init_barrier(&full[i], 0, 1);
@@ -123,8 +124,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
 
   Schedule<1, NUM_SM / CLUSTERS, BM * CLUSTER_M, BN * CLUSTER_N, 16 / CLUSTER_M,
            8 / CLUSTER_N>
-      // schedule(Ms[group_offset], Ns[group_offset], cluster_id);
-      schedule(params.M, params.N, cluster_id);
+      schedule(params, cluster_id);
 
   uint32_t cluster_rank = ClusterOps::get_cluster_rank();
   uint32_t rank_m = cluster_rank / CLUSTER_N;
@@ -159,6 +159,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
           PTXBarrier::expect_bytes_tx(&full[qidx],
                                       (BK * BN + BK * BM) * sizeof(bf16));
 
+          // Handle loads for A matrix
           if (CLUSTER_N > 1) {
             uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
             if (rank_n == 0) {
@@ -171,6 +172,7 @@ __launch_bounds__(NUM_THREADS) void __cluster_dims__(CLUSTER_M *CLUSTER_N, 1, 1)
                                block_k_iter * BK, num_block_m * BM);
           }
 
+          // Handle loads for B matrix
           if (CLUSTER_M > 1) {
             if (rank_m == 0) {
               TMAOps::load_async_multicast(
@@ -355,8 +357,13 @@ public:
       printf("Creating descriptors for group %d: M=%d, N=%d, K=%d\n", i,
              m_dims[i], n_dims[i], k_dims[i]);
 
-      // Store parameters
-      params.push_back({m_dims[i], n_dims[i], k_dims[i], as[i], bs[i], cs[i]});
+      // Calculate total blocks for this GEMM
+      int total_blocks_m = CEIL_DIV(m_dims[i], BM);
+      int total_blocks_n = CEIL_DIV(n_dims[i], BN);
+
+      // Store parameters with block counts
+      params.push_back({m_dims[i], n_dims[i], k_dims[i], total_blocks_m,
+                        total_blocks_n, as[i], bs[i], cs[i]});
 
       // Create TMA descriptors
       tmaAs.push_back(TensorMapManager::create_tensor_map<BM, BK>(
@@ -365,8 +372,9 @@ public:
           bs[i], n_dims[i], k_dims[i]));
       tmaCs.push_back(TensorMapManager::create_tensor_map<BN, BM, false>(
           cs[i], n_dims[i], m_dims[i]));
+
+      cudaCheck(cudaDeviceSynchronize());
     }
-    cudaCheck(cudaDeviceSynchronize());
   }
 
   void launch() {
@@ -386,8 +394,9 @@ public:
 
     // Launch kernel for each group
     for (size_t i = 0; i < params.size(); i++) {
-      printf("Launching group %d: M=%d, N=%d, K=%d\n", i, params[i].M,
-             params[i].N, params[i].K);
+      printf("Launching group %d: M=%d, N=%d, K=%d (blocks: %d x %d)\n", i,
+             params[i].M, params[i].N, params[i].K, params[i].total_blocks_m,
+             params[i].total_blocks_n);
 
       groupGemmKernel<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M,
                       CLUSTER_N>
@@ -408,3 +417,7 @@ public:
 } // namespace groupgemm
 
 ////////////////////
+
+// Per-GEMM parameters struct updated to include dimensions for the schedule
+
+// namespace groupgemm

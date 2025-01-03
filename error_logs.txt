@@ -1,9 +1,15 @@
 === Testing batch size 1 ===
 Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
+Initializing batch with 1 groups
+Creating descriptors for group 0: M=2048, N=2048, K=2048
 
 Warmup phase...
+Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
+Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
+Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
 
 Verification phase...
+Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
 Verifying GEMM 0 (2048x2048x2048): Mismatch at [0,0]: ref=-32.250000 test=-43.750000 (diff=11.500000)
 Mismatch at [0,1]: ref=25.750000 test=-107.500000 (diff=133.250000)
 Mismatch at [0,2]: ref=-31.250000 test=-116.000000 (diff=84.750000)
@@ -20,7 +26,11 @@ FAILED!
 
 === Testing batch size 2 ===
 Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
-Matrix 3072x2048x1024 (Padded: 3072x2048x1024)
+Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
+Initializing batch with 2 groups
+Creating descriptors for group 0: M=2048, N=2048, K=2048
+Creating descriptors for group 1: M=2048, N=2048, K=2048
 
 Warmup phase...
-CUDA error 700 at examples/matmul/group_gemm.cuh:392: an illegal memory access was encountered
+Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
+CUDA error 700 at examples/matmul/group_gemm.cuh:405: an illegal memory access was encountered
