@@ -1,36 +1,25 @@
 === Testing batch size 1 ===
 Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
 Initializing batch with 1 groups
-Creating descriptors for group 0: M=2048, N=2048, K=2048
+Configuration: BM=128, BN=256, BK=64, CLUSTER_M=2, CLUSTER_N=1
+
+Group 0:
+  Dimensions: M=2048, N=2048, K=2048
+  Memory: A=0x7f968ca00000, B=0x7f968d200000, C=0x7f968e400000
+  Creating TMA descriptors...
+  Group 0 initialization complete
 
 Warmup phase...
-Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
-Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
-Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
 
-Verification phase...
-Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
-Verifying GEMM 0 (2048x2048x2048): Mismatch at [0,0]: ref=-32.250000 test=-43.750000 (diff=11.500000)
-Mismatch at [0,1]: ref=25.750000 test=-107.500000 (diff=133.250000)
-Mismatch at [0,2]: ref=-31.250000 test=-116.000000 (diff=84.750000)
-Mismatch at [0,3]: ref=18.500000 test=-61.000000 (diff=79.500000)
-Mismatch at [0,4]: ref=-29.500000 test=41.000000 (diff=70.500000)
-Mismatch at [0,5]: ref=71.000000 test=51.750000 (diff=19.250000)
-Mismatch at [0,6]: ref=-75.500000 test=-19.500000 (diff=56.000000)
-Mismatch at [0,7]: ref=-61.500000 test=-15.375000 (diff=46.125000)
-Mismatch at [0,8]: ref=-43.500000 test=9.312500 (diff=52.812500)
-Mismatch at [0,9]: ref=-91.500000 test=-66.500000 (diff=25.000000)
-Max difference: 342.000000 at index 43187
-Total errors: 4189018
-FAILED!
+Launching GroupGemm kernels:
+Shared memory size: 213120 bytes
 
-=== Testing batch size 2 ===
-Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
-Matrix 2048x2048x2048 (Padded: 2048x2048x2048)
-Initializing batch with 2 groups
-Creating descriptors for group 0: M=2048, N=2048, K=2048
-Creating descriptors for group 1: M=2048, N=2048, K=2048
-
-Warmup phase...
-Launching group 0: M=2048, N=2048, K=2048 (blocks: 16 x 8)
-CUDA error 700 at examples/matmul/group_gemm.cuh:405: an illegal memory access was encountered
+Launching group 0:
+  Grid: 128 blocks, 384 threads/block
+  Matrix: M=2048, N=2048, K=2048
+Kernel start: cluster_id=0, cluster_rank=0, rank_m=0, rank_n=0
+Initialized barriers 0: full=0x7f9700034400, empty=0x7f9700034418
+Initialized barriers 1: full=0x7f9700034408, empty=0x7f9700034420
+Initialized barriers 2: full=0x7f9700034410, empty=0x7f9700034428
+Schedule initialized: M=2048, N=2048, total_blocks_m=16, total_blocks_n=8
+CUDA error 715 at examples/matmul/group_gemm.cuh:412: an illegal instruction was encountered
